@@ -1,0 +1,83 @@
+{
+  "name": "EJBCA Rust React",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "latest",
+      "profile": "default",
+      "components": "rustfmt,clippy"
+    },
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "22",
+      "nodeGypDependencies": true
+    },
+    "ghcr.io/devcontainers/features/java:1": {
+      "version": "21",
+      "jdkDistro": "ms",
+      "installGradle": false
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "remoteUser": "vscode",
+  "postCreateCommand": "bash .devcontainer/setup-tools.sh",
+  "forwardPorts": [
+    3000,
+    5173,
+    8080,
+    8443
+  ],
+  "portsAttributes": {
+    "3000": {
+      "label": "Rust API"
+    },
+    "5173": {
+      "label": "React Vite"
+    },
+    "8080": {
+      "label": "HTTP service"
+    },
+    "8443": {
+      "label": "HTTPS service"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "tamasfe.even-better-toml",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "bradlc.vscode-tailwindcss",
+        "vitest.explorer",
+        "mhutchie.git-graph",
+        "eamodio.gitlens",
+        "ms-azuretools.vscode-docker",
+        "github.vscode-github-actions",
+        "EditorConfig.EditorConfig",
+        "redhat.java",
+        "vscjava.vscode-gradle"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "eslint.validate": [
+          "javascript",
+          "javascriptreact",
+          "typescript",
+          "typescriptreact"
+        ],
+        "files.watcherExclude": {
+          "**/.gradle/**": true,
+          "**/node_modules/**": true,
+          "**/target/**": true
+        },
+        "rust-analyzer.cargo.features": "all",
+        "rust-analyzer.check.command": "clippy",
+        "typescript.preferences.importModuleSpecifier": "relative"
+      }
+    }
+  }
+}
