@@ -1,0 +1,14 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: ejbca-rs
+    metrics_path: /metrics
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials: dev-admin-token
+    static_configs:
+      - targets:
+          - 127.0.0.1:18080

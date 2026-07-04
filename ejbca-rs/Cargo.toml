@@ -1,0 +1,39 @@
+[package]
+name = "ejbca-rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive", "env"] }
+hex = "0.4"
+futures-util = "0.3"
+hmac = "0.12"
+openssl = "0.10"
+pem = "3.0"
+rand = "0.8"
+rcgen = { version = "0.14.8", features = ["pem", "ring", "x509-parser", "zeroize"] }
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+ring = "0.17"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha1 = "0.10"
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "time", "uuid", "json"] }
+subtle = "2.6"
+thiserror = "2.0"
+time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
+tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "fs", "time", "sync"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1.18", features = ["v4", "serde"] }
+x509-parser = "0.18"
+zeroize = "1.8"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
