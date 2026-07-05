@@ -1,5 +1,5 @@
 import React from 'react';
-import { Download, FileKey, Home, ScrollText, ShieldCheck, SlidersHorizontal, Trash2 } from 'lucide-react';
+import { BookOpen, Download, FileKey, Home, ScrollText, ShieldCheck, SlidersHorizontal, Trash2 } from 'lucide-react';
 import { Metric, Panel, Table } from '../components/common';
 import { formatTs } from '../lib/format';
 
@@ -18,6 +18,7 @@ export function DashboardPage({ data }) {
             label="정책"
             value={summary ? summary.certificate_profile_count + summary.end_entity_profile_count + summary.cmp_alias_count : '-'}
           />
+          <Metric icon={BookOpen} label="EJBCA 기능" value={summary?.ejbca_feature_count ?? '-'} />
         </section>
       </Panel>
       <Panel title="최근 감사 상태" icon={ScrollText}>

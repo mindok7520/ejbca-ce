@@ -360,6 +360,7 @@ mod tests {
             std::env::temp_dir().join(format!("ejbca-rs-validator-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&data_dir).unwrap();
         let settings = Arc::new(Settings {
+            config_file: None,
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             data_dir: data_dir.to_string_lossy().to_string(),
             database_url: None,

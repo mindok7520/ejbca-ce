@@ -1,0 +1,65 @@
+# ejbca-rs runtime configuration.
+# Copy this file to ./ejbca-rs.toml and edit values for your environment.
+
+bind_addr = "127.0.0.1:8080"
+data_dir = "./data"
+database_url = "sqlite://./data/ejbca-rs.sqlite"
+admin_token = "change-this-admin-token"
+public_base_url = "http://127.0.0.1:8080"
+
+ca_key_provider = "database"
+# ca_key_dir = "./data/ca-keys"
+# ca_key_encryption_secret = "change-this-long-random-secret"
+
+max_request_bytes = 100000
+max_list_limit = 1000
+cors_allowed_origins = ""
+
+adminweb_client_cert_required = false
+adminweb_client_cert_header = "x-admin-client-cert-pem"
+# adminweb_client_cert_proxy_secret = "change-this-proxy-secret"
+adminweb_client_cert_allowed_fingerprints = ""
+adminweb_client_cert_allowed_subjects = ""
+
+database_max_connections = 32
+database_busy_timeout_seconds = 30
+max_concurrent_issuance = 128
+
+validator_webhook_default_timeout_ms = 3000
+validator_webhook_max_timeout_ms = 30000
+validator_webhook_max_response_bytes = 8192
+
+json_logs = false
+log_level = "info"
+log_output = "stdout"
+# log_dir = "./data/logs"
+log_retention_days = 14
+log_retention_files = 30
+
+metrics_enabled = true
+metrics_public = false
+metrics_device_limit = 100
+metrics_event_retention_days = 90
+audit_event_retention_days = 365
+
+maintenance_enabled = false
+maintenance_interval_seconds = 3600
+maintenance_backup = false
+maintenance_purge_expired_certificates = false
+maintenance_purge_expired_crls = false
+maintenance_purge_audit_events = false
+maintenance_optimize = false
+maintenance_older_than_days = 30
+maintenance_batch_size = 100
+maintenance_generate_crls = false
+maintenance_crl_validity_days = 7
+maintenance_crl_partition_count = 1
+
+# Default CMP HMAC/PBM secret used when an alias-specific entry is not present.
+cmp_secret = "cmp-shared-secret"
+
+# Alias-specific CMP secrets. Keys may be the exact alias or the normalized
+# uppercase alias used by EJBCA_RS_CMP_SECRET_<ALIAS>.
+[cmp_alias_secrets]
+iot-ra = "cmp-shared-secret"
+vendor-ra = "vendor-cmp-shared-secret"

@@ -27,6 +27,7 @@ subtle = "2.6"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "macros", "parsing", "serde"] }
 tokio = { version = "1.48", features = ["macros", "rt-multi-thread", "signal", "fs", "time", "sync"] }
+toml = "0.8"
 tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-appender = "0.2"

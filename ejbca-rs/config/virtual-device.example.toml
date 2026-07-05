@@ -1,0 +1,21 @@
+# Virtual RA device simulation input.
+# Run with:
+# cargo run -- --config-file ejbca-rs.toml simulate-device --device-config config/virtual-device.example.toml
+
+device_id = "device-001"
+server_url = "http://127.0.0.1:8080"
+alias = "iot-ra"
+
+# The subject must satisfy the selected end entity profile and validators.
+subject_dn = "CN=device-001,O=Example Devices,C=KR"
+dns_names = ["device-001.example.internal"]
+
+# Prefer defining the secret in ejbca-rs.toml under [cmp_alias_secrets].
+# hmac_secret = "cmp-shared-secret"
+
+output_dir = "./data/simulated-devices/device-001"
+private_key_pem_file = "device-key.pem"
+csr_pem_file = "device.csr.pem"
+request_der_file = "cmp-request.der"
+response_der_file = "cmp-response.der"
+summary_json_file = "summary.json"

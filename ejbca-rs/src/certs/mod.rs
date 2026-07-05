@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
 pub struct IssueCertificateRequest {
+    pub end_entity_id: Option<String>,
+    pub approval_id: Option<String>,
     pub ca_id: Option<String>,
     pub certificate_profile_id: Option<String>,
     pub end_entity_profile_id: Option<String>,
@@ -15,6 +17,8 @@ pub struct IssueCertificateRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct IssuePkcs12Request {
+    pub end_entity_id: Option<String>,
+    pub approval_id: Option<String>,
     pub ca_id: Option<String>,
     pub certificate_profile_id: Option<String>,
     pub end_entity_profile_id: Option<String>,
@@ -29,6 +33,8 @@ pub struct IssuePkcs12Request {
 impl From<&IssuePkcs12Request> for IssueCertificateRequest {
     fn from(value: &IssuePkcs12Request) -> Self {
         Self {
+            end_entity_id: value.end_entity_id.clone(),
+            approval_id: value.approval_id.clone(),
             ca_id: value.ca_id.clone(),
             certificate_profile_id: value.certificate_profile_id.clone(),
             end_entity_profile_id: value.end_entity_profile_id.clone(),
@@ -49,6 +55,8 @@ pub struct Pkcs12IssueResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct IssueCsrRequest {
+    pub end_entity_id: Option<String>,
+    pub approval_id: Option<String>,
     pub ca_id: Option<String>,
     pub certificate_profile_id: Option<String>,
     pub end_entity_profile_id: Option<String>,
@@ -70,12 +78,15 @@ pub struct IssuePublicKeyRequest {
 #[derive(Debug, Deserialize)]
 pub struct RevokeCertificateRequest {
     pub reason: Option<String>,
+    pub approval_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CertificateResponse {
     pub id: String,
     pub ca_id: String,
+    pub certificate_profile_id: Option<String>,
+    pub end_entity_profile_id: Option<String>,
     pub serial_hex: String,
     pub subject_dn: String,
     pub dns_names: Vec<String>,
@@ -95,6 +106,8 @@ pub struct CertificateResponse {
 pub struct CertificateSummaryResponse {
     pub id: String,
     pub ca_id: String,
+    pub certificate_profile_id: Option<String>,
+    pub end_entity_profile_id: Option<String>,
     pub serial_hex: String,
     pub subject_dn: String,
     pub dns_names: Vec<String>,

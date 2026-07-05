@@ -32,6 +32,7 @@ pub async fn issue_generated(
     request: IssueCertificateRequest,
     actor: &str,
 ) -> AppResult<CertificateResponse> {
+    let request = crate::ra::hydrate_issue_certificate_request(state, request).await?;
     let started = std::time::Instant::now();
     let device_id = device_id_from_parts(&request.subject_dn, &request.dns_names);
     let request_ca_id = request.ca_id.clone();
@@ -113,6 +114,19 @@ async fn issue_generated_inner(
     request: IssueCertificateRequest,
     actor: &str,
 ) -> AppResult<CertificateResponse> {
+    let approval_target = request
+        .end_entity_id
+        .as_deref()
+        .unwrap_or(&request.subject_dn)
+        .to_string();
+    crate::ra::ensure_approval_permits(
+        state,
+        "issue",
+        &approval_target,
+        request.approval_id.as_deref(),
+    )
+    .await?;
+    let end_entity_id = request.end_entity_id.clone();
     let ca = resolve_ca(state, request.ca_id.as_deref()).await?;
     let issuer = load_issuer(&ca).await?;
     let policy = resolve_issuance_policy(
@@ -121,6 +135,7 @@ async fn issue_generated_inner(
         request.end_entity_profile_id.as_deref(),
     )
     .await?;
+    enforce_issue_access_rules(state, actor, "admin_api", &ca, &policy).await?;
     validate_issuance_policy(
         &policy,
         &request.subject_dn,
@@ -170,6 +185,7 @@ async fn issue_generated_inner(
     let private_key_pem = key_pair.serialize_pem();
     let record = build_record(
         &ca,
+        &policy,
         serial_hex,
         request.subject_dn,
         request.dns_names,
@@ -180,6 +196,8 @@ async fn issue_generated_inner(
         not_after.unix_timestamp(),
     )?;
     store_issued_certificate(state, actor, &record).await?;
+    crate::ra::mark_end_entity_generated(state, end_entity_id.as_deref()).await?;
+    crate::publisher::dispatch_certificate_event(state, "issue", &record, actor).await?;
     Ok(to_response(record, Some(private_key_pem)))
 }
 
@@ -197,6 +215,7 @@ pub async fn issue_from_csr_with_source(
     actor: &str,
     source: &str,
 ) -> AppResult<CertificateResponse> {
+    let request = crate::ra::hydrate_issue_csr_request(state, request).await?;
     let started = std::time::Instant::now();
     let request_ca_id = request.ca_id.clone();
     record_issue_event(
@@ -214,7 +233,7 @@ pub async fn issue_from_csr_with_source(
     .await;
 
     let result = match acquire_issue_permit(state) {
-        Ok(_permit) => issue_from_csr_inner(state, request, actor).await,
+        Ok(_permit) => issue_from_csr_inner(state, request, actor, source).await,
         Err(err) => Err(err),
     };
     record_issue_result(state, &result, request_ca_id, None, None, started, source).await;
@@ -246,7 +265,7 @@ pub async fn issue_from_public_key_with_source(
     .await;
 
     let result = match acquire_issue_permit(state) {
-        Ok(_permit) => issue_from_public_key_inner(state, request, actor).await,
+        Ok(_permit) => issue_from_public_key_inner(state, request, actor, source).await,
         Err(err) => Err(err),
     };
     record_issue_result(
@@ -279,6 +298,7 @@ async fn issue_from_csr_inner(
     state: &AppState,
     request: IssueCsrRequest,
     actor: &str,
+    source: &str,
 ) -> AppResult<CertificateResponse> {
     let ca = resolve_ca(state, request.ca_id.as_deref()).await?;
     let issuer = load_issuer(&ca).await?;
@@ -288,6 +308,7 @@ async fn issue_from_csr_inner(
         request.end_entity_profile_id.as_deref(),
     )
     .await?;
+    enforce_issue_access_rules(state, actor, source, &ca, &policy).await?;
     let validity_days = policy_validity_days(&policy, request.validity_days);
     let not_before = now() - Duration::minutes(5);
     let not_after = days_from_now(validity_days);
@@ -297,6 +318,26 @@ async fn issue_from_csr_inner(
         .map_err(|err| AppError::BadRequest(format!("CSR 파싱/검증에 실패했습니다: {err}")))?;
     let subject_dn = format_distinguished_name(&csr.params.distinguished_name);
     let dns_names = san_to_dns_names(&csr.params.subject_alt_names);
+    crate::ra::ensure_end_entity_matches_request(
+        state,
+        request.end_entity_id.as_deref(),
+        &subject_dn,
+        &dns_names,
+    )
+    .await?;
+    let approval_target = request
+        .end_entity_id
+        .as_deref()
+        .unwrap_or(&subject_dn)
+        .to_string();
+    crate::ra::ensure_approval_permits(
+        state,
+        "issue",
+        &approval_target,
+        request.approval_id.as_deref(),
+    )
+    .await?;
+    let end_entity_id = request.end_entity_id.clone();
     validate_issuance_policy(&policy, &subject_dn, &dns_names, IssuanceMode::Csr)?;
 
     validate_pre_issue(
@@ -337,6 +378,7 @@ async fn issue_from_csr_inner(
     let cert = csr.signed_by(&issuer)?;
     let record = build_record(
         &ca,
+        &policy,
         serial_hex,
         subject_dn,
         dns_names,
@@ -347,6 +389,8 @@ async fn issue_from_csr_inner(
         not_after.unix_timestamp(),
     )?;
     store_issued_certificate(state, actor, &record).await?;
+    crate::ra::mark_end_entity_generated(state, end_entity_id.as_deref()).await?;
+    crate::publisher::dispatch_certificate_event(state, "issue", &record, actor).await?;
     Ok(to_response(record, None))
 }
 
@@ -354,6 +398,7 @@ async fn issue_from_public_key_inner(
     state: &AppState,
     request: IssuePublicKeyRequest,
     actor: &str,
+    source: &str,
 ) -> AppResult<CertificateResponse> {
     let ca = resolve_ca(state, request.ca_id.as_deref()).await?;
     let issuer = load_issuer(&ca).await?;
@@ -363,6 +408,7 @@ async fn issue_from_public_key_inner(
         request.end_entity_profile_id.as_deref(),
     )
     .await?;
+    enforce_issue_access_rules(state, actor, source, &ca, &policy).await?;
     validate_issuance_policy(
         &policy,
         &request.subject_dn,
@@ -412,6 +458,7 @@ async fn issue_from_public_key_inner(
     let cert = params.signed_by(&public_key, &issuer)?;
     let record = build_record(
         &ca,
+        &policy,
         serial_hex,
         request.subject_dn,
         request.dns_names,
@@ -422,6 +469,7 @@ async fn issue_from_public_key_inner(
         not_after.unix_timestamp(),
     )?;
     store_issued_certificate(state, actor, &record).await?;
+    crate::publisher::dispatch_certificate_event(state, "issue", &record, actor).await?;
     Ok(to_response(record, None))
 }
 
@@ -519,8 +567,27 @@ pub async fn revoke_certificate(
     state: &AppState,
     cert_id: &str,
     reason: Option<String>,
+    approval_id: Option<String>,
     actor: &str,
 ) -> AppResult<CertificateResponse> {
+    revoke_certificate_with_source(state, cert_id, reason, approval_id, actor, "admin_api").await
+}
+
+async fn revoke_certificate_with_source(
+    state: &AppState,
+    cert_id: &str,
+    reason: Option<String>,
+    approval_id: Option<String>,
+    actor: &str,
+    source: &str,
+) -> AppResult<CertificateResponse> {
+    crate::ra::ensure_approval_permits(state, "revoke", cert_id, approval_id.as_deref()).await?;
+    let existing = state
+        .db
+        .get_certificate(cert_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("인증서를 찾을 수 없습니다: {cert_id}")))?;
+    enforce_revoke_access_rules(state, actor, source, &existing).await?;
     let reason = reason.unwrap_or_else(|| "unspecified".to_string());
     let details_json = serde_json::json!({"reason": reason}).to_string();
     let changed = state
@@ -538,6 +605,7 @@ pub async fn revoke_certificate(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("인증서를 찾을 수 없습니다: {cert_id}")))?;
     record_revoke_event(state, &record, actor).await;
+    crate::publisher::dispatch_certificate_event(state, "revoke", &record, actor).await?;
     Ok(to_response(record, None))
 }
 
@@ -557,7 +625,15 @@ pub async fn revoke_certificate_by_serial(
                 "CA에서 serial에 해당하는 인증서를 찾을 수 없습니다: ca_id={ca_id}, serial={serial_hex}"
             ))
         })?;
-    revoke_certificate(state, &cert.id, Some(reason.to_string()), actor).await
+    revoke_certificate_with_source(
+        state,
+        &cert.id,
+        Some(reason.to_string()),
+        None,
+        actor,
+        "cmp",
+    )
+    .await
 }
 
 async fn resolve_ca(state: &AppState, ca_id: Option<&str>) -> AppResult<CaRecord> {
@@ -652,6 +728,53 @@ fn policy_validity_days(policy: &IssuancePolicy, requested_days: Option<i64>) ->
     requested_days.unwrap_or(profile_max).clamp(1, profile_max)
 }
 
+async fn enforce_issue_access_rules(
+    state: &AppState,
+    actor: &str,
+    protocol: &str,
+    ca: &CaRecord,
+    policy: &IssuancePolicy,
+) -> AppResult<()> {
+    crate::access_rules::enforce_access_rules(
+        state,
+        &crate::access_rules::AccessRuleContext {
+            actor,
+            action: "issue",
+            protocol,
+            ca_id: Some(ca.id.as_str()),
+            certificate_profile_id: policy
+                .certificate_profile
+                .as_ref()
+                .map(|profile| profile.id.as_str()),
+            end_entity_profile_id: policy
+                .end_entity_profile
+                .as_ref()
+                .map(|profile| profile.id.as_str()),
+        },
+    )
+    .await
+}
+
+async fn enforce_revoke_access_rules(
+    state: &AppState,
+    actor: &str,
+    protocol: &str,
+    record: &CertificateRecord,
+) -> AppResult<()> {
+    crate::access_rules::enforce_access_rules(
+        state,
+        &crate::access_rules::AccessRuleContext {
+            actor,
+            action: "revoke",
+            protocol,
+            ca_id: Some(record.ca_id.as_str()),
+            certificate_profile_id: record.certificate_profile_id.as_deref(),
+            end_entity_profile_id: record.end_entity_profile_id.as_deref(),
+        },
+    )
+    .await
+}
+
 fn validate_issuance_policy(
     policy: &IssuancePolicy,
     subject_dn: &str,
@@ -714,6 +837,7 @@ fn dns_allowed_by_domains(dns: &str, domains: &[String]) -> bool {
 
 fn build_record(
     ca: &CaRecord,
+    policy: &IssuancePolicy,
     serial_hex: String,
     subject_dn: String,
     dns_names: Vec<String>,
@@ -726,6 +850,14 @@ fn build_record(
     Ok(CertificateRecord {
         id: Uuid::new_v4().to_string(),
         ca_id: ca.id.clone(),
+        certificate_profile_id: policy
+            .certificate_profile
+            .as_ref()
+            .map(|profile| profile.id.clone()),
+        end_entity_profile_id: policy
+            .end_entity_profile
+            .as_ref()
+            .map(|profile| profile.id.clone()),
         serial_hex,
         subject_dn,
         san_json: serde_json::to_string(&dns_names)
@@ -748,6 +880,8 @@ fn to_response(record: CertificateRecord, private_key_pem: Option<String>) -> Ce
     CertificateResponse {
         id: record.id,
         ca_id: record.ca_id,
+        certificate_profile_id: record.certificate_profile_id,
+        end_entity_profile_id: record.end_entity_profile_id,
         serial_hex: record.serial_hex,
         subject_dn: record.subject_dn,
         dns_names,
@@ -768,6 +902,8 @@ fn to_summary_response(record: CertificateRecord) -> CertificateSummaryResponse 
     CertificateSummaryResponse {
         id: record.id,
         ca_id: record.ca_id,
+        certificate_profile_id: record.certificate_profile_id,
+        end_entity_profile_id: record.end_entity_profile_id,
         serial_hex: record.serial_hex,
         subject_dn: record.subject_dn,
         dns_names,
@@ -946,12 +1082,18 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use super::*;
-    use crate::{ca, config::Settings, profiles, storage::Db};
+    use crate::{
+        ca,
+        config::Settings,
+        profiles,
+        storage::{Db, EjbcaFeatureRecord},
+    };
 
     async fn test_state(max_concurrent_issuance: usize) -> (AppState, PathBuf) {
         let data_dir = std::env::temp_dir().join(format!("ejbca-rs-cert-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&data_dir).expect("테스트 data dir 생성 실패");
         let settings = Arc::new(Settings {
+            config_file: None,
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             data_dir: data_dir.to_string_lossy().to_string(),
             database_url: None,
@@ -1021,6 +1163,8 @@ mod tests {
 
     fn generated_request(index: usize) -> IssueCertificateRequest {
         IssueCertificateRequest {
+            end_entity_id: None,
+            approval_id: None,
             ca_id: None,
             certificate_profile_id: None,
             end_entity_profile_id: None,
@@ -1036,6 +1180,8 @@ mod tests {
         let response = issue_pkcs12(
             &state,
             IssuePkcs12Request {
+                end_entity_id: None,
+                approval_id: None,
                 ca_id: None,
                 certificate_profile_id: None,
                 end_entity_profile_id: None,
@@ -1058,6 +1204,124 @@ mod tests {
             .unwrap();
         assert!(parsed.cert.is_some());
         assert!(parsed.pkey.is_some());
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_publisher_receives_issue_and_revoke_events() {
+        let (state, data_dir) = test_state(4).await;
+        let publisher_path = data_dir.join("publisher-events.ndjson");
+        let now = crate::util::now_unix();
+        state
+            .db
+            .insert_ejbca_feature(&EjbcaFeatureRecord {
+                id: "file-publisher".to_string(),
+                feature_type: "publisher".to_string(),
+                name: "file-publisher".to_string(),
+                status: "active".to_string(),
+                config_json: serde_json::json!({
+                    "type": "file",
+                    "path": publisher_path,
+                    "events": ["issue", "revoke"]
+                })
+                .to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let issued = issue_generated(&state, generated_request(1), "publisher-test")
+            .await
+            .unwrap();
+        revoke_certificate(
+            &state,
+            &issued.id,
+            Some("key_compromise".to_string()),
+            None,
+            "publisher-test",
+        )
+        .await
+        .unwrap();
+
+        let published = tokio::fs::read_to_string(&publisher_path).await.unwrap();
+        assert!(published.contains(r#""event_type":"issue""#));
+        assert!(published.contains(r#""event_type":"revoke""#));
+        assert!(published.contains(&issued.serial_hex));
+
+        std::fs::remove_dir_all(data_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn access_rule_scopes_limit_issue_by_actor_ca_profile_and_protocol() {
+        let (state, data_dir) = test_state(4).await;
+        let ca = state.db.list_cas().await.unwrap().remove(0);
+        let certificate_profile = state
+            .db
+            .list_certificate_profiles()
+            .await
+            .unwrap()
+            .remove(0);
+        let end_entity_profile = state.db.list_end_entity_profiles().await.unwrap().remove(0);
+        let now = crate::util::now_unix();
+        state
+            .db
+            .insert_ejbca_feature(&EjbcaFeatureRecord {
+                id: "access-rule-issue-scope".to_string(),
+                feature_type: "access_rule".to_string(),
+                name: "issue-scope".to_string(),
+                status: "active".to_string(),
+                config_json: serde_json::json!({
+                    "mode": "allowlist",
+                    "rules": [{
+                        "effect": "allow",
+                        "actors": ["role:issuer"],
+                        "actions": ["issue", "revoke"],
+                        "protocols": ["admin_api"],
+                        "ca_ids": [ca.id],
+                        "certificate_profile_ids": [certificate_profile.id],
+                        "end_entity_profile_ids": [end_entity_profile.id]
+                    }]
+                })
+                .to_string(),
+                created_at: now,
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+
+        let mut allowed = generated_request(1);
+        allowed.ca_id = Some(ca.id.clone());
+        allowed.certificate_profile_id = Some(certificate_profile.id.clone());
+        allowed.end_entity_profile_id = Some(end_entity_profile.id.clone());
+        let issued = issue_generated(&state, allowed, "role:issuer")
+            .await
+            .unwrap();
+        assert_eq!(
+            issued.certificate_profile_id.as_deref(),
+            Some(certificate_profile.id.as_str())
+        );
+        assert_eq!(
+            issued.end_entity_profile_id.as_deref(),
+            Some(end_entity_profile.id.as_str())
+        );
+        revoke_certificate(
+            &state,
+            &issued.id,
+            Some("superseded".to_string()),
+            None,
+            "role:issuer",
+        )
+        .await
+        .unwrap();
+
+        let mut denied = generated_request(2);
+        denied.ca_id = Some(ca.id);
+        denied.certificate_profile_id = Some(certificate_profile.id);
+        denied.end_entity_profile_id = Some(end_entity_profile.id);
+        let result = issue_generated(&state, denied, "role:other").await;
+        assert!(matches!(result, Err(AppError::Forbidden(_))));
 
         std::fs::remove_dir_all(data_dir).ok();
     }
@@ -1187,6 +1451,7 @@ mod tests {
             &state,
             &issued.id,
             Some("key_compromise".to_string()),
+            None,
             "atomicity-test",
         )
         .await;

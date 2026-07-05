@@ -1,11 +1,15 @@
+mod access_rules;
 mod api;
 mod asn1;
 mod ca;
 mod certs;
 mod cli;
+mod cluster;
 mod cmp;
+mod compat;
 mod config;
 mod crl;
+mod enrollment;
 mod error;
 mod key_provider;
 mod logging;
@@ -13,6 +17,8 @@ mod maintenance;
 mod metrics;
 mod ocsp;
 mod profiles;
+mod publisher;
+mod ra;
 mod storage;
 mod util;
 mod validators;
@@ -78,6 +84,7 @@ async fn main() -> anyhow::Result<()> {
 
     ca::service::ensure_default_ca(&state).await?;
     profiles::service::ensure_default_profiles(&state).await?;
+    compat::ensure_default_features(&state).await?;
 
     if let Some(command) = command {
         if !matches!(command, config::Command::Serve) {

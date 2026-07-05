@@ -23,6 +23,20 @@ pub struct UpdateCaRequest {
     pub make_default: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RenewCaRequest {
+    pub validity_days: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RolloverCaRequest {
+    pub name: Option<String>,
+    pub subject_dn: Option<String>,
+    pub validity_days: Option<i64>,
+    pub make_default: Option<bool>,
+    pub disable_old: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct CaResponse {
     pub id: String,

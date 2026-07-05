@@ -9,8 +9,9 @@ use crate::{
     cmp::{CmpMessageSummary, CmpStatusResponse},
     error::{AppError, AppResult},
     profiles::service as profile_service,
-    storage::CmpAliasRecord,
+    storage::{CmpAliasRecord, EjbcaFeatureFilter},
 };
+use axum::http::HeaderMap;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
@@ -188,6 +189,7 @@ pub fn summarize_pki_message_der(body: &[u8]) -> AppResult<CmpMessageSummary> {
 pub async fn accept_cmp_envelope(
     state: &AppState,
     alias: &str,
+    headers: Option<&HeaderMap>,
     body: &[u8],
 ) -> AppResult<CmpStatusResponse> {
     // EJBCA CmpServlet와 동일하게 입력 크기를 선제 제한하고, PKIBody 타입별 handler로 분기한다.
@@ -216,15 +218,19 @@ pub async fn accept_cmp_envelope(
     }
 
     let mut message = parse_pki_message(body)?;
-    message.protection_verified = enforce_cmp_message_protection(alias, &alias_config, &message)?;
+    message.protection_verified =
+        enforce_cmp_message_protection(state, alias, &alias_config, &message, headers).await?;
     if message.body_tag == 4 {
         return handle_p10cr(state, alias, &alias_config, message).await;
     }
-    if matches!(message.body_tag, 0 | 2) {
+    if matches!(message.body_tag, 0 | 2 | 7) {
         return handle_crmf(state, alias, &alias_config, message).await;
     }
     if message.body_tag == 11 {
         return handle_rr(state, alias, &alias_config, message).await;
+    }
+    if message.body_tag == 24 {
+        return handle_cert_conf(state, alias, message).await;
     }
 
     state
@@ -371,15 +377,22 @@ fn parse_pki_message(body: &[u8]) -> AppResult<ParsedPkiMessage> {
     })
 }
 
-fn enforce_cmp_message_protection(
+async fn enforce_cmp_message_protection(
+    state: &AppState,
     alias: &str,
     alias_config: &CmpAliasRecord,
     message: &ParsedPkiMessage,
+    headers: Option<&HeaderMap>,
 ) -> AppResult<bool> {
+    let certificate_auth_verified =
+        enforce_cmp_certificate_auth_modules(state, alias, headers).await?;
     if alias_config.hmac_secret_sha256.is_none() {
+        if certificate_auth_verified {
+            return Ok(true);
+        }
         if message.protected {
             return Err(AppError::Forbidden(
-                "CMP message protection이 있는 요청은 HMAC secret이 설정된 alias에서만 처리합니다"
+                "CMP message protection이 있는 요청은 HMAC secret 또는 cmp_auth_module certificate 정책이 설정된 alias에서만 처리합니다"
                     .to_string(),
             ));
         }
@@ -390,12 +403,358 @@ fn enforce_cmp_message_protection(
             "CMP alias에는 message protection이 필요합니다: {alias}"
         )));
     }
-    // DB에는 원문 secret을 저장하지 않고, 런타임 환경변수 값이 저장된 KDF hash와 일치할 때만 PBM 검증에 사용한다.
+    // DB에는 원문 secret을 저장하지 않고, 런타임 설정 secret이 저장된 KDF hash와 일치할 때만 PBM 검증에 사용한다.
     let mut secret = load_cmp_alias_secret(alias, alias_config)?;
     let result = verify_pbm_message_protection(message, &secret);
     secret.zeroize();
     result?;
     Ok(true)
+}
+
+#[derive(Debug, Clone)]
+struct CmpClientCertificate {
+    subject_dn: String,
+    issuer_dn: String,
+    serial_hex: String,
+    fingerprint_sha256: String,
+}
+
+async fn enforce_cmp_certificate_auth_modules(
+    state: &AppState,
+    alias: &str,
+    headers: Option<&HeaderMap>,
+) -> AppResult<bool> {
+    let features = state
+        .db
+        .list_ejbca_features(
+            &EjbcaFeatureFilter {
+                feature_type: Some("cmp_auth_module".to_string()),
+                status: None,
+            },
+            200,
+        )
+        .await?;
+
+    for feature in features {
+        if !matches!(feature.status.as_str(), "active" | "configured") {
+            continue;
+        }
+        let config =
+            serde_json::from_str::<serde_json::Value>(&feature.config_json).unwrap_or_default();
+        for rule in cmp_auth_rules(&config) {
+            if !cmp_certificate_auth_rule_applies(&rule, alias) {
+                continue;
+            }
+            let header_name = string_value(&rule, &["client_cert_header", "certificate_header"])
+                .unwrap_or_else(|| state.settings.adminweb_client_cert_header.clone());
+            verify_cmp_proxy_secret(&rule, headers)?;
+            let parsed = parse_cmp_client_certificate_from_headers(headers, &header_name)?;
+            verify_cmp_client_certificate_rule(&rule, &parsed)?;
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn cmp_auth_rules(config: &serde_json::Value) -> Vec<serde_json::Value> {
+    if let Some(rules) = config.get("rules").and_then(serde_json::Value::as_array) {
+        return rules
+            .iter()
+            .filter(|rule| rule.is_object())
+            .cloned()
+            .collect();
+    }
+    if config.is_object() {
+        vec![config.clone()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn cmp_certificate_auth_rule_applies(rule: &serde_json::Value, alias: &str) -> bool {
+    if rule
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .is_some_and(|enabled| !enabled)
+    {
+        return false;
+    }
+    let modes = values_for(
+        rule,
+        &[
+            "module",
+            "modules",
+            "mode",
+            "modes",
+            "authentication_module",
+            "authentication_modules",
+            "type",
+        ],
+    );
+    let certificate_mode = modes.is_empty()
+        || modes.iter().any(|value| {
+            let normalized = normalize_policy_value(value);
+            matches!(
+                normalized.as_str(),
+                "endentitycertificate"
+                    | "vendorcertificate"
+                    | "clientcertificate"
+                    | "mtls"
+                    | "tlsclientcertificate"
+            )
+        });
+    let explicitly_enforced = rule_bool(rule, "require_client_certificate")
+        || !values_for(rule, &["aliases", "alias", "cmp_aliases", "cmp_alias"]).is_empty()
+        || rule.get("client_cert_header").is_some()
+        || rule.get("certificate_header").is_some()
+        || rule.get("proxy_secret").is_some()
+        || !values_for(
+            rule,
+            &[
+                "allowed_fingerprints",
+                "fingerprints",
+                "allowed_subjects",
+                "subject_dns",
+                "allowed_issuer_dns",
+                "issuer_dns",
+                "serial_hexes",
+            ],
+        )
+        .is_empty();
+    certificate_mode
+        && explicitly_enforced
+        && value_matches_any(
+            values_for(rule, &["aliases", "alias", "cmp_aliases", "cmp_alias"]),
+            alias,
+        )
+}
+
+fn parse_cmp_client_certificate_from_headers(
+    headers: Option<&HeaderMap>,
+    header_name: &str,
+) -> AppResult<CmpClientCertificate> {
+    let headers = headers.ok_or_else(|| {
+        AppError::Forbidden("CMP certificate 인증에는 HTTP header context가 필요합니다".to_string())
+    })?;
+    let cert_header = headers
+        .get(header_name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            AppError::Forbidden(format!(
+                "CMP client certificate 헤더가 필요합니다: {header_name}"
+            ))
+        })?;
+    parse_cmp_client_certificate(cert_header)
+}
+
+fn verify_cmp_proxy_secret(rule: &serde_json::Value, headers: Option<&HeaderMap>) -> AppResult<()> {
+    let Some(expected_secret) = string_value(rule, &["proxy_secret"]) else {
+        return Ok(());
+    };
+    let header_name = string_value(rule, &["proxy_secret_header"])
+        .unwrap_or_else(|| "x-cmp-proxy-secret".to_string());
+    let supplied = headers
+        .and_then(|headers| headers.get(header_name.as_str()))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if supplied
+        .as_bytes()
+        .ct_eq(expected_secret.as_bytes())
+        .unwrap_u8()
+        == 1
+    {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(format!(
+            "CMP client certificate proxy secret이 일치하지 않습니다: {header_name}"
+        )))
+    }
+}
+
+fn verify_cmp_client_certificate_rule(
+    rule: &serde_json::Value,
+    parsed: &CmpClientCertificate,
+) -> AppResult<()> {
+    let fingerprint_allowed = value_matches_any_normalized(
+        values_for(
+            rule,
+            &["allowed_fingerprints", "fingerprints", "fingerprint"],
+        ),
+        &parsed.fingerprint_sha256,
+        true,
+    );
+    let subject_allowed = value_matches_any(
+        values_for(rule, &["allowed_subjects", "subject_dns", "subjects"]),
+        &parsed.subject_dn,
+    );
+    let issuer_allowed = value_matches_any(
+        values_for(
+            rule,
+            &["allowed_issuer_dns", "issuer_dns", "issuers", "issuer"],
+        ),
+        &parsed.issuer_dn,
+    );
+    let serial_allowed = value_matches_any_normalized(
+        values_for(rule, &["serial_hexes", "serials", "serial_hex"]),
+        &parsed.serial_hex,
+        true,
+    );
+    if fingerprint_allowed && subject_allowed && issuer_allowed && serial_allowed {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(format!(
+            "CMP client certificate가 alias 인증 정책과 일치하지 않습니다: subject={}, issuer={}, serial={}",
+            parsed.subject_dn, parsed.issuer_dn, parsed.serial_hex
+        )))
+    }
+}
+
+fn parse_cmp_client_certificate(value: &str) -> AppResult<CmpClientCertificate> {
+    let decoded = decode_client_certificate_header(value)?;
+    let pem = pem::parse(decoded.as_bytes()).map_err(|err| {
+        AppError::Forbidden(format!("CMP client certificate PEM 파싱 실패: {err}"))
+    })?;
+    let cert_der = pem.contents();
+    let (_, cert) = X509Certificate::from_der(cert_der).map_err(|err| {
+        AppError::Forbidden(format!("CMP client certificate DER 파싱 실패: {err}"))
+    })?;
+    Ok(CmpClientCertificate {
+        subject_dn: cert.subject().to_string(),
+        issuer_dn: cert.issuer().to_string(),
+        serial_hex: profile_service::normalize_hex_identifier(&hex::encode(
+            cert.tbs_certificate.raw_serial(),
+        )),
+        fingerprint_sha256: hex::encode(Sha256::digest(cert_der)),
+    })
+}
+
+fn decode_client_certificate_header(value: &str) -> AppResult<String> {
+    let mut value = value.trim();
+    if let Some(cert_start) = value.find("Cert=\"") {
+        value = &value[cert_start + "Cert=\"".len()..];
+        if let Some(cert_end) = value.find('"') {
+            value = &value[..cert_end];
+        }
+    }
+    Ok(percent_decode(value)?.replace("\\n", "\n"))
+}
+
+fn percent_decode(value: &str) -> AppResult<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(AppError::Forbidden(
+                    "CMP client certificate percent encoding이 잘렸습니다".to_string(),
+                ));
+            }
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).map_err(|_| {
+                AppError::Forbidden(
+                    "CMP client certificate percent encoding이 올바르지 않습니다".to_string(),
+                )
+            })?;
+            let byte = u8::from_str_radix(hex, 16).map_err(|_| {
+                AppError::Forbidden(
+                    "CMP client certificate percent encoding이 올바르지 않습니다".to_string(),
+                )
+            })?;
+            out.push(byte);
+            index += 3;
+        } else {
+            out.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).map_err(|_| {
+        AppError::Forbidden("CMP client certificate 헤더가 UTF-8이 아닙니다".to_string())
+    })
+}
+
+fn string_value(config: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| config.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn rule_bool(config: &serde_json::Value, key: &str) -> bool {
+    config
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn values_for(config: &serde_json::Value, keys: &[&str]) -> Vec<String> {
+    for key in keys {
+        let Some(value) = config.get(*key) else {
+            continue;
+        };
+        if let Some(value) = value.as_str() {
+            return split_csv_values(value);
+        }
+        if let Some(values) = value.as_array() {
+            return values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+fn split_csv_values(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn value_matches_any(values: Vec<String>, actual: &str) -> bool {
+    if values.is_empty() {
+        return true;
+    }
+    let actual = actual.trim().to_ascii_lowercase();
+    values.iter().any(|value| {
+        let value = value.trim().to_ascii_lowercase();
+        value == "*" || value == actual
+    })
+}
+
+fn value_matches_any_normalized(values: Vec<String>, actual: &str, hex_like: bool) -> bool {
+    if values.is_empty() {
+        return true;
+    }
+    let actual = normalize_identifier(actual, hex_like);
+    values.iter().any(|value| {
+        let value = normalize_identifier(value, hex_like);
+        value == "*" || value == actual
+    })
+}
+
+fn normalize_identifier(value: &str, hex_like: bool) -> String {
+    let value = value.trim().to_ascii_lowercase();
+    if hex_like {
+        value.replace([':', ' ', '-'], "")
+    } else {
+        value
+    }
+}
+
+fn normalize_policy_value(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-', '_'], "")
 }
 
 fn load_cmp_alias_secret(alias: &str, alias_config: &CmpAliasRecord) -> AppResult<Vec<u8>> {
@@ -404,16 +763,17 @@ fn load_cmp_alias_secret(alias: &str, alias_config: &CmpAliasRecord) -> AppResul
         .as_deref()
         .ok_or_else(|| AppError::Internal("CMP alias HMAC hash가 없습니다".to_string()))?;
     let env_name = cmp_secret_env_name(alias);
-    let mut secret = std::env::var(&env_name)
-        .or_else(|_| std::env::var("EJBCA_RS_CMP_SECRET"))
-        .map_err(|_| {
+    let mut secret = crate::config::configured_cmp_alias_secret(alias)
+        .or_else(|| std::env::var(&env_name).ok())
+        .or_else(|| std::env::var("EJBCA_RS_CMP_SECRET").ok())
+        .ok_or_else(|| {
             AppError::Forbidden(format!(
-                "CMP alias secret 환경변수가 필요합니다: {env_name} 또는 EJBCA_RS_CMP_SECRET"
+                "CMP alias secret 설정이 필요합니다: config cmp_alias_secrets.{alias}, cmp_secret, {env_name}, 또는 EJBCA_RS_CMP_SECRET"
             ))
         })?;
     if secret.is_empty() {
         return Err(AppError::Forbidden(format!(
-            "CMP alias secret 환경변수가 비어 있습니다: {env_name}"
+            "CMP alias secret 설정이 비어 있습니다: {alias}"
         )));
     }
     if !profile_service::verify_persisted_secret(&secret, configured_hash) {
@@ -714,6 +1074,8 @@ async fn handle_p10cr(
     let issued = cert_service::issue_from_csr_with_source(
         state,
         IssueCsrRequest {
+            end_entity_id: None,
+            approval_id: None,
             ca_id: alias_config.ca_id.clone(),
             certificate_profile_id: alias_config.certificate_profile_id.clone(),
             end_entity_profile_id: alias_config.end_entity_profile_id.clone(),
@@ -777,7 +1139,12 @@ async fn handle_crmf(
     message: ParsedPkiMessage,
 ) -> AppResult<CmpStatusResponse> {
     let requests = extract_crmf_cert_requests(&message)?;
-    let response_body_tag = if message.body_tag == 0 { 1 } else { 3 };
+    let response_body_tag = match message.body_tag {
+        0 => 1,
+        2 => 3,
+        7 => 8,
+        _ => unreachable!("handle_crmf only accepts ir, cr, and kur"),
+    };
     let mut issued_ids = Vec::with_capacity(requests.len());
     let mut issued_serials = Vec::with_capacity(requests.len());
     let mut issued_cert_pem = None;
@@ -823,6 +1190,7 @@ async fn handle_crmf(
                 "body_type": message.body_type,
                 "body_tag": message.body_tag,
                 "response_body_tag": response_body_tag,
+                "flow": if message.body_tag == 7 { "kur" } else { "enroll" },
                 "certificate_ids": &issued_ids,
                 "serials": &issued_serials,
                 "protected": message.protected,
@@ -835,9 +1203,13 @@ async fn handle_crmf(
 
     Ok(CmpStatusResponse {
         alias: alias.to_string(),
-        status: "issued".to_string(),
+        status: if message.body_tag == 7 {
+            "updated".to_string()
+        } else {
+            "issued".to_string()
+        },
         detail: format!(
-            "CMP {} CRMF 요청을 처리해 인증서 {}개를 발급했습니다",
+            "CMP {} CRMF 요청을 처리해 인증서 {}개를 발급/갱신했습니다",
             message.body_type,
             issued_ids.len()
         ),
@@ -850,6 +1222,50 @@ async fn handle_crmf(
         cert_pem: issued_cert_pem,
         issued_certificate_ids: issued_ids,
         issued_serial_hexes: issued_serials,
+        revoked_certificate_ids: Vec::new(),
+        revoked_serial_hexes: Vec::new(),
+        pkixcmp_der_base64: Some(STANDARD.encode(&pkixcmp_der)),
+        pkixcmp_der: Some(pkixcmp_der),
+    })
+}
+
+async fn handle_cert_conf(
+    state: &AppState,
+    alias: &str,
+    message: ParsedPkiMessage,
+) -> AppResult<CmpStatusResponse> {
+    let pkixcmp_der = cmp_pki_confirm_der(&message.header_der)?;
+    state
+        .db
+        .audit(
+            "cmp-client",
+            "cmp.certconf",
+            alias,
+            "success",
+            &serde_json::json!({
+                "body_type": message.body_type,
+                "body_tag": message.body_tag,
+                "protected": message.protected,
+                "protection_verified": message.protection_verified,
+                "extra_certs": message.extra_certs
+            })
+            .to_string(),
+        )
+        .await?;
+
+    Ok(CmpStatusResponse {
+        alias: alias.to_string(),
+        status: "confirmed".to_string(),
+        detail: "CMP certConf 요청을 확인하고 pkiconf 응답을 생성했습니다".to_string(),
+        body_type: Some(message.body_type),
+        body_tag: Some(message.body_tag),
+        protected: message.protected,
+        extra_certs: message.extra_certs,
+        issued_certificate_id: None,
+        serial_hex: None,
+        cert_pem: None,
+        issued_certificate_ids: Vec::new(),
+        issued_serial_hexes: Vec::new(),
         revoked_certificate_ids: Vec::new(),
         revoked_serial_hexes: Vec::new(),
         pkixcmp_der_base64: Some(STANDARD.encode(&pkixcmp_der)),
@@ -943,9 +1359,9 @@ fn extract_p10cr_csr_der(message: &ParsedPkiMessage) -> AppResult<Vec<u8>> {
 }
 
 fn extract_crmf_cert_requests(message: &ParsedPkiMessage) -> AppResult<Vec<CrmfCertRequest>> {
-    if !matches!(message.body_tag, 0 | 2) {
+    if !matches!(message.body_tag, 0 | 2 | 7) {
         return Err(AppError::BadRequest(
-            "CMP body가 ir/cr이 아닙니다".to_string(),
+            "CMP body가 ir/cr/kur이 아닙니다".to_string(),
         ));
     }
     let cert_req_messages = parse_single(&message.body_der).map_err(|err| {
@@ -1437,6 +1853,12 @@ fn cmp_rev_rep_pki_message_der(
     Ok(der_sequence(join([header, body])))
 }
 
+fn cmp_pki_confirm_der(request_header_der: &[u8]) -> AppResult<Vec<u8>> {
+    let header = cmp_response_header_der(request_header_der)?;
+    let body = der_explicit_context(19, vec![0x05, 0x00]);
+    Ok(der_sequence(join([header, body])))
+}
+
 fn cmp_response_header_der(request_header_der: &[u8]) -> AppResult<Vec<u8>> {
     let root = parse_single(request_header_der)
         .map_err(|err| AppError::BadRequest(format!("CMP header DER 파싱 실패: {err}")))?;
@@ -1535,6 +1957,8 @@ mod tests {
     use crate::asn1::{
         der_bit_string, der_context_constructed, der_octet_string, der_oid, der_tlv,
     };
+    use crate::util::parse_distinguished_name;
+    use axum::http::HeaderValue;
     use rcgen::{CertificateParams, KeyPair, PublicKeyData};
 
     #[test]
@@ -1568,6 +1992,43 @@ mod tests {
         let parsed = parse_pki_message(&message).unwrap();
 
         assert!(verify_pbm_message_protection(&parsed, b"wrong-secret").is_err());
+    }
+
+    #[test]
+    fn verifies_cmp_client_certificate_policy_from_proxy_header() {
+        let key_pair = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.distinguished_name =
+            parse_distinguished_name("CN=vendor-ra,O=VendorA,C=KR").unwrap();
+        let cert = params.self_signed(&key_pair).unwrap();
+        let encoded_pem = cert.pem().replace('\n', "%0A");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-cmp-client-cert-pem",
+            HeaderValue::from_str(&encoded_pem).unwrap(),
+        );
+        headers.insert(
+            "x-cmp-proxy-secret",
+            HeaderValue::from_static("proxy-secret"),
+        );
+
+        let parsed =
+            parse_cmp_client_certificate_from_headers(Some(&headers), "x-cmp-client-cert-pem")
+                .unwrap();
+        let rule = serde_json::json!({
+            "module": "EndEntityCertificate",
+            "client_cert_header": "x-cmp-client-cert-pem",
+            "proxy_secret": "proxy-secret",
+            "allowed_subjects": [parsed.subject_dn.clone()]
+        });
+        verify_cmp_proxy_secret(&rule, Some(&headers)).unwrap();
+        verify_cmp_client_certificate_rule(&rule, &parsed).unwrap();
+
+        let denied = serde_json::json!({
+            "module": "vendor_certificate",
+            "allowed_subjects": ["CN=other-ra,O=VendorA,C=KR"]
+        });
+        assert!(verify_cmp_client_certificate_rule(&denied, &parsed).is_err());
     }
 
     #[test]
@@ -1639,6 +2100,21 @@ mod tests {
     }
 
     #[test]
+    fn builds_pki_confirm_response_der() {
+        let request_header = [
+            0x30, 0x10, // PKIHeader
+            0x02, 0x01, 0x02, // pvno
+            0xa4, 0x02, 0x30, 0x00, // sender
+            0xa4, 0x02, 0x30, 0x00, // recipient
+            0x84, 0x03, 0x01, 0x02, 0x03, // transactionID
+        ];
+        let der = cmp_pki_confirm_der(&request_header).unwrap();
+        let parsed = parse_pki_message(&der).unwrap();
+        assert_eq!(parsed.body_tag, 19);
+        assert_eq!(parsed.body_type, "pkiconf");
+    }
+
+    #[test]
     fn extracts_crmf_cert_request() {
         let key_pair = KeyPair::generate().unwrap();
         let spki = key_pair.subject_public_key_info();
@@ -1659,7 +2135,7 @@ mod tests {
         let cert_req_messages = der_sequence(cert_req_msg);
         let der = der_sequence(join([
             der_sequence(vec![0x05, 0x00]),
-            der_explicit_context(0, cert_req_messages),
+            der_explicit_context(0, cert_req_messages.clone()),
         ]));
 
         let parsed = parse_pki_message(&der).unwrap();
@@ -1669,6 +2145,15 @@ mod tests {
         assert_eq!(requests[0].subject_dn, "CN=device-crmf");
         assert_eq!(requests[0].dns_names, vec!["device-crmf.example.com"]);
         assert_eq!(requests[0].subject_public_key_info_der, spki);
+
+        let kur_der = der_sequence(join([
+            der_sequence(vec![0x05, 0x00]),
+            der_explicit_context(7, cert_req_messages),
+        ]));
+        let parsed = parse_pki_message(&kur_der).unwrap();
+        let requests = extract_crmf_cert_requests(&parsed).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].subject_dn, "CN=device-crmf");
     }
 
     #[test]

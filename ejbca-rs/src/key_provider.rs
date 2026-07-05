@@ -251,21 +251,24 @@ fn parse_command_key_ref(key_ref: &str) -> AppResult<CommandSignerConfig> {
 }
 
 fn ca_key_encryption_enabled() -> bool {
-    std::env::var(CA_KEY_ENCRYPTION_ENV)
+    crate::config::configured_ca_key_encryption_secret()
+        .or_else(|| std::env::var(CA_KEY_ENCRYPTION_ENV).ok())
         .map(|value| !value.is_empty())
         .unwrap_or(false)
 }
 
 fn ca_key_encryption_secret_required() -> AppResult<String> {
-    let secret = std::env::var(CA_KEY_ENCRYPTION_ENV).map_err(|_| {
-        AppError::BadRequest(format!(
-            "암호화된 CA key를 사용하려면 {CA_KEY_ENCRYPTION_ENV} 환경변수가 필요합니다"
-        ))
-    })?;
+    let secret = crate::config::configured_ca_key_encryption_secret()
+        .or_else(|| std::env::var(CA_KEY_ENCRYPTION_ENV).ok())
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "암호화된 CA key를 사용하려면 ca_key_encryption_secret 설정 또는 {CA_KEY_ENCRYPTION_ENV} 환경변수가 필요합니다"
+            ))
+        })?;
     if secret.is_empty() {
-        return Err(AppError::BadRequest(format!(
-            "{CA_KEY_ENCRYPTION_ENV} 환경변수가 비어 있습니다"
-        )));
+        return Err(AppError::BadRequest(
+            "ca_key_encryption_secret 설정이 비어 있습니다".to_string(),
+        ));
     }
     Ok(secret)
 }

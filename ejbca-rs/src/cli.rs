@@ -1,4 +1,5 @@
 use std::{
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -7,16 +8,20 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     AppState,
-    ca::{CreateCaRequest, ImportCaRequest, UpdateCaRequest, service as ca_service},
-    certs::{
-        IssueCertificateRequest, IssueCsrRequest, IssuePkcs12Request, RevokeCertificateRequest,
-        service as cert_service,
+    ca::{
+        CreateCaRequest, ImportCaRequest, RenewCaRequest, RolloverCaRequest, UpdateCaRequest,
+        service as ca_service,
     },
+    certs::{
+        IssueCertificateRequest, IssueCsrRequest, IssuePkcs12Request, service as cert_service,
+    },
+    cluster::{self as cluster_service, ClusterHeartbeatRequest},
     cmp::service as cmp_service,
+    compat::{self as compat_service, CreateEjbcaFeatureRequest, UpdateEjbcaFeatureRequest},
     config::Command,
     crl::{GenerateCrlRequest, service as crl_service},
     key_provider::{self, CommandSignerConfig},
@@ -27,6 +32,10 @@ use crate::{
         CreateAccessRoleRequest, CreateCertificateProfileRequest, CreateCmpAliasRequest,
         CreateEndEntityProfileRequest, UpdateAccessRoleRequest, UpdateCertificateProfileRequest,
         UpdateCmpAliasRequest, UpdateEndEntityProfileRequest, service as profile_service,
+    },
+    ra::{
+        self as ra_service, CreateApprovalRequest, CreateEndEntityRequest, DecideApprovalRequest,
+        UpdateEndEntityRequest,
     },
     storage::{AuditEventFilter, CertificateFilter},
     util::parse_distinguished_name,
@@ -74,6 +83,34 @@ pub async fn run(command: Command, state: &AppState) -> Result<()> {
             .await?;
             print_json(response)?;
         }
+        Command::RenewCa { id, validity_days } => {
+            let response =
+                ca_service::renew_ca(state, &id, RenewCaRequest { validity_days }, "cli").await?;
+            print_json(response)?;
+        }
+        Command::RolloverCa {
+            id,
+            name,
+            subject_dn,
+            validity_days,
+            make_default,
+            disable_old,
+        } => {
+            let response = ca_service::rollover_ca(
+                state,
+                &id,
+                RolloverCaRequest {
+                    name,
+                    subject_dn,
+                    validity_days,
+                    make_default: make_default.then_some(true),
+                    disable_old: disable_old.then_some(true),
+                },
+                "cli",
+            )
+            .await?;
+            print_json(response)?;
+        }
         Command::ImportCa {
             name,
             cert_pem_file,
@@ -114,6 +151,32 @@ pub async fn run(command: Command, state: &AppState) -> Result<()> {
             let key_pem = tokio::fs::read_to_string(&key_pem_file).await?;
             let reference = key_provider::encrypted_key_ref_from_pem(&key_pem)?;
             println!("{reference}");
+        }
+        Command::ListClusterNodes { limit } => {
+            print_json(cluster_service::list_nodes(state, list_limit(limit, state)).await?)?;
+        }
+        Command::ClusterHeartbeat {
+            node_id,
+            role,
+            status,
+            metadata_json,
+        } => {
+            let metadata = match metadata_json {
+                Some(value) => serde_json::from_str(&value)?,
+                None => serde_json::json!({}),
+            };
+            let response = cluster_service::heartbeat(
+                state,
+                ClusterHeartbeatRequest {
+                    node_id,
+                    role,
+                    status,
+                    metadata,
+                },
+                "cli",
+            )
+            .await?;
+            print_json(response)?;
         }
         Command::ListCertificateProfiles => {
             print_json(profile_service::list_certificate_profiles(state).await?)?;
@@ -215,6 +278,144 @@ pub async fn run(command: Command, state: &AppState) -> Result<()> {
             profile_service::delete_end_entity_profile(state, &id, "cli").await?;
             print_json(serde_json::json!({"deleted": true, "id": id}))?;
         }
+        Command::ListEndEntities {
+            username,
+            status,
+            ca_id,
+            limit,
+        } => {
+            print_json(
+                ra_service::list_end_entities(
+                    state,
+                    clean_filter(username),
+                    clean_filter(status),
+                    clean_filter(ca_id),
+                    list_limit(limit, state),
+                )
+                .await?,
+            )?;
+        }
+        Command::CreateEndEntity {
+            username,
+            subject_dn,
+            dns_names,
+            email,
+            ca_id,
+            certificate_profile_id,
+            end_entity_profile_id,
+            status,
+            password,
+            token_type,
+        } => {
+            let response = ra_service::create_end_entity(
+                state,
+                CreateEndEntityRequest {
+                    username,
+                    subject_dn,
+                    dns_names,
+                    email,
+                    ca_id,
+                    certificate_profile_id,
+                    end_entity_profile_id,
+                    status,
+                    password,
+                    token_type,
+                },
+                "cli",
+            )
+            .await?;
+            print_json(response)?;
+        }
+        Command::UpdateEndEntity {
+            id,
+            username,
+            subject_dn,
+            dns_names,
+            email,
+            ca_id,
+            certificate_profile_id,
+            end_entity_profile_id,
+            status,
+            password,
+            token_type,
+        } => {
+            let response = ra_service::update_end_entity(
+                state,
+                &id,
+                UpdateEndEntityRequest {
+                    username,
+                    subject_dn,
+                    dns_names: non_empty_vec(dns_names),
+                    email,
+                    ca_id,
+                    certificate_profile_id,
+                    end_entity_profile_id,
+                    status,
+                    password,
+                    token_type,
+                },
+                "cli",
+            )
+            .await?;
+            print_json(response)?;
+        }
+        Command::DeleteEndEntity { id } => {
+            ra_service::delete_end_entity(state, &id, "cli").await?;
+            print_json(serde_json::json!({"deleted": true, "id": id}))?;
+        }
+        Command::ListApprovals {
+            action,
+            target_id,
+            status,
+            limit,
+        } => {
+            print_json(
+                ra_service::list_approval_requests(
+                    state,
+                    clean_filter(action),
+                    clean_filter(target_id),
+                    clean_filter(status),
+                    list_limit(limit, state),
+                )
+                .await?,
+            )?;
+        }
+        Command::CreateApproval {
+            action,
+            target_id,
+            request_json,
+            expires_at,
+        } => {
+            let response = ra_service::create_approval_request(
+                state,
+                CreateApprovalRequest {
+                    action,
+                    target_id,
+                    request: serde_json::from_str(&request_json)?,
+                    expires_at,
+                },
+                "cli",
+            )
+            .await?;
+            print_json(response)?;
+        }
+        Command::DecideApproval {
+            id,
+            status,
+            decision_json,
+        } => {
+            let response = ra_service::decide_approval_request(
+                state,
+                &id,
+                DecideApprovalRequest {
+                    status,
+                    decision: serde_json::from_str(&decision_json)?,
+                },
+                "cli",
+            )
+            .await?;
+            print_json(response)?;
+        }
         Command::ListCmpAliases => print_json(profile_service::list_cmp_aliases(state).await?)?,
         Command::CreateCmpAlias {
             alias,
@@ -308,6 +509,13 @@ pub async fn run(command: Command, state: &AppState) -> Result<()> {
             .await?;
             print_json(summary)?;
         }
+        Command::SimulateDevice {
+            device_config,
+            output_dir,
+        } => {
+            let summary = run_virtual_device_simulation(state, &device_config, output_dir).await?;
+            print_json(summary)?;
+        }
         Command::ListAccessRoles => print_json(profile_service::list_access_roles(state).await?)?,
         Command::CreateAccessRole {
             name,
@@ -365,6 +573,70 @@ pub async fn run(command: Command, state: &AppState) -> Result<()> {
             profile_service::delete_access_role(state, &id, "cli").await?;
             print_json(serde_json::json!({"deleted": true, "id": id}))?;
         }
+        Command::ListEjbcaFeatures {
+            feature_type,
+            status,
+            limit,
+        } => {
+            print_json(
+                compat_service::list_features(
+                    state,
+                    clean_filter(feature_type),
+                    clean_filter(status),
+                    list_limit(limit, state),
+                )
+                .await?,
+            )?;
+        }
+        Command::CreateEjbcaFeature {
+            feature_type,
+            name,
+            status,
+            config_json,
+        } => {
+            let config = serde_json::from_str(&config_json)?;
+            let response = compat_service::create_feature(
+                state,
+                CreateEjbcaFeatureRequest {
+                    feature_type,
+                    name,
+                    status: Some(status),
+                    config,
+                },
+                "cli",
+            )
+            .await?;
+            print_json(response)?;
+        }
+        Command::UpdateEjbcaFeature {
+            id,
+            feature_type,
+            name,
+            status,
+            config_json,
+        } => {
+            let config = match config_json {
+                Some(value) => Some(serde_json::from_str(&value)?),
+                None => None,
+            };
+            let response = compat_service::update_feature(
+                state,
+                &id,
+                UpdateEjbcaFeatureRequest {
+                    feature_type,
+                    name,
+                    status,
+                    config,
+                },
+                "cli",
+            )
+            .await?;
+            print_json(response)?;
+        }
+        Command::DeleteEjbcaFeature { id } => {
+            compat_service::delete_feature(state, &id, "cli").await?;
+            print_json(serde_json::json!({"deleted": true, "id": id}))?;
+        }
         Command::ListCertificates {
             limit,
             ca_id,
@@ -411,6 +683,8 @@ pub async fn run(command: Command, state: &AppState) -> Result<()> {
             }
         }
         Command::IssueCertificate {
+            end_entity_id,
+            approval_id,
             ca_id,
             certificate_profile_id,
             end_entity_profile_id,
@@ -421,6 +695,8 @@ pub async fn run(command: Command, state: &AppState) -> Result<()> {
             let response = cert_service::issue_generated(
                 state,
                 IssueCertificateRequest {
+                    end_entity_id,
+                    approval_id,
                     ca_id,
                     certificate_profile_id,
                     end_entity_profile_id,
@@ -434,6 +710,8 @@ pub async fn run(command: Command, state: &AppState) -> Result<()> {
             print_json(response)?;
         }
         Command::IssueBrowserCertificate {
+            end_entity_id,
+            approval_id,
             ca_id,
             certificate_profile_id,
             end_entity_profile_id,
@@ -447,6 +725,8 @@ pub async fn run(command: Command, state: &AppState) -> Result<()> {
             let response = cert_service::issue_pkcs12(
                 state,
                 IssuePkcs12Request {
+                    end_entity_id,
+                    approval_id,
                     ca_id,
                     certificate_profile_id,
                     end_entity_profile_id,
@@ -529,6 +809,8 @@ pub async fn run(command: Command, state: &AppState) -> Result<()> {
             print_json(summary)?;
         }
         Command::IssueCsr {
+            end_entity_id,
+            approval_id,
             ca_id,
             certificate_profile_id,
             end_entity_profile_id,
@@ -539,6 +821,8 @@ pub async fn run(command: Command, state: &AppState) -> Result<()> {
             let response = cert_service::issue_from_csr(
                 state,
                 IssueCsrRequest {
+                    end_entity_id,
+                    approval_id,
                     ca_id,
                     certificate_profile_id,
                     end_entity_profile_id,
@@ -550,14 +834,13 @@ pub async fn run(command: Command, state: &AppState) -> Result<()> {
             .await?;
             print_json(response)?;
         }
-        Command::RevokeCertificate { id, reason } => {
-            let response = cert_service::revoke_certificate(
-                state,
-                &id,
-                RevokeCertificateRequest { reason }.reason,
-                "cli",
-            )
-            .await?;
+        Command::RevokeCertificate {
+            id,
+            reason,
+            approval_id,
+        } => {
+            let response =
+                cert_service::revoke_certificate(state, &id, reason, approval_id, "cli").await?;
             print_json(response)?;
         }
         Command::ListCrls { limit } => {
@@ -769,6 +1052,13 @@ struct CmpP10crSmokeOptions {
     response_der_file: Option<String>,
 }
 
+struct GeneratedCmpP10cr {
+    private_key_pem: String,
+    csr_pem: String,
+    request_der: Vec<u8>,
+    request_protected: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct CmpP10crSmokeSummary {
     url: String,
@@ -804,20 +1094,74 @@ struct CmpIssueRevokeSmokeSummary {
     revocation_status_count: usize,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default)]
+struct VirtualDeviceConfig {
+    device_id: String,
+    server_url: String,
+    alias: String,
+    subject_dn: String,
+    dns_names: Vec<String>,
+    hmac_secret: Option<String>,
+    output_dir: Option<String>,
+    private_key_pem_file: Option<String>,
+    csr_pem_file: Option<String>,
+    request_der_file: Option<String>,
+    response_der_file: Option<String>,
+    summary_json_file: Option<String>,
+}
+
+impl Default for VirtualDeviceConfig {
+    fn default() -> Self {
+        Self {
+            device_id: "device-001".to_string(),
+            server_url: String::new(),
+            alias: "iot-ra".to_string(),
+            subject_dn: "CN=device-001,O=Example Devices,C=KR".to_string(),
+            dns_names: vec!["device-001.example.internal".to_string()],
+            hmac_secret: None,
+            output_dir: None,
+            private_key_pem_file: None,
+            csr_pem_file: None,
+            request_der_file: None,
+            response_der_file: None,
+            summary_json_file: None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct VirtualDeviceSimulationSummary {
+    device_id: String,
+    alias: String,
+    subject_dn: String,
+    dns_names: Vec<String>,
+    url: String,
+    output_dir: String,
+    private_key_pem_file: String,
+    csr_pem_file: String,
+    request_der_file: String,
+    response_der_file: String,
+    summary_json_file: String,
+    request_der_bytes: usize,
+    request_protected: bool,
+    response_der_bytes: usize,
+    response_body_type: String,
+    response_body_tag: u64,
+    response_protected: bool,
+    response_extra_certs: bool,
+    issued_serial_hexes: Vec<String>,
+}
+
 async fn run_cmp_p10cr_smoke(options: CmpP10crSmokeOptions) -> Result<CmpP10crSmokeSummary> {
-    let key_pair = KeyPair::generate()?;
-    let mut params = CertificateParams::new(options.dns_names.clone())?;
-    params.distinguished_name = parse_distinguished_name(&options.subject_dn)?;
-    let csr = params.serialize_request(&key_pair)?;
-    let csr_der = csr.der().as_ref().to_vec();
-    let request_der = cmp_service::build_p10cr_pki_message_der(
-        &csr_der,
-        options.hmac_secret.as_deref().map(str::as_bytes),
+    let generated = build_cmp_p10cr_request(
+        &options.subject_dn,
+        &options.dns_names,
+        options.hmac_secret.as_deref(),
     )?;
-    let request_summary = cmp_service::summarize_pki_message_der(&request_der)?;
 
     if let Some(path) = &options.request_der_file {
-        tokio::fs::write(path, &request_der)
+        tokio::fs::write(path, &generated.request_der)
             .await
             .with_context(|| format!("CMP 요청 DER 파일을 쓸 수 없습니다: {path}"))?;
     }
@@ -827,7 +1171,7 @@ async fn run_cmp_p10cr_smoke(options: CmpP10crSmokeOptions) -> Result<CmpP10crSm
         options.server_url.trim_end_matches('/'),
         options.alias
     );
-    let response_bytes = post_cmp_pkixcmp(&url, request_der.clone()).await?;
+    let response_bytes = post_cmp_pkixcmp(&url, generated.request_der.clone()).await?;
 
     let response_summary = cmp_service::summarize_pki_message_der(&response_bytes)?;
     if let Some(path) = &options.response_der_file {
@@ -838,8 +1182,8 @@ async fn run_cmp_p10cr_smoke(options: CmpP10crSmokeOptions) -> Result<CmpP10crSm
 
     Ok(CmpP10crSmokeSummary {
         url,
-        request_der_bytes: request_der.len(),
-        request_protected: request_summary.protected,
+        request_der_bytes: generated.request_der.len(),
+        request_protected: generated.request_protected,
         response_der_bytes: response_bytes.len(),
         response_body_type: response_summary.body_type,
         response_body_tag: response_summary.body_tag,
@@ -849,6 +1193,186 @@ async fn run_cmp_p10cr_smoke(options: CmpP10crSmokeOptions) -> Result<CmpP10crSm
         request_der_file: options.request_der_file,
         response_der_file: options.response_der_file,
     })
+}
+
+async fn run_virtual_device_simulation(
+    state: &AppState,
+    device_config: &str,
+    output_dir_override: Option<String>,
+) -> Result<VirtualDeviceSimulationSummary> {
+    let config = load_virtual_device_config(device_config).await?;
+    let hmac_secret = config
+        .hmac_secret
+        .clone()
+        .or_else(|| crate::config::configured_cmp_alias_secret(&config.alias));
+    let generated = build_cmp_p10cr_request(
+        &config.subject_dn,
+        &config.dns_names,
+        hmac_secret.as_deref(),
+    )?;
+
+    let output_dir = output_dir_override
+        .or(config.output_dir.clone())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(&state.settings.data_dir)
+                .join("simulated-devices")
+                .join(&config.device_id)
+        });
+    tokio::fs::create_dir_all(&output_dir)
+        .await
+        .with_context(|| {
+            format!(
+                "시뮬레이션 출력 디렉터리를 만들 수 없습니다: {}",
+                output_dir.display()
+            )
+        })?;
+
+    let private_key_pem_file = resolve_output_file(
+        &output_dir,
+        config.private_key_pem_file.as_deref(),
+        "device-key.pem",
+    );
+    let csr_pem_file = resolve_output_file(
+        &output_dir,
+        config.csr_pem_file.as_deref(),
+        "device.csr.pem",
+    );
+    let request_der_file = resolve_output_file(
+        &output_dir,
+        config.request_der_file.as_deref(),
+        "cmp-request.der",
+    );
+    let response_der_file = resolve_output_file(
+        &output_dir,
+        config.response_der_file.as_deref(),
+        "cmp-response.der",
+    );
+    let summary_json_file = resolve_output_file(
+        &output_dir,
+        config.summary_json_file.as_deref(),
+        "summary.json",
+    );
+
+    tokio::fs::write(&private_key_pem_file, generated.private_key_pem.as_bytes())
+        .await
+        .with_context(|| {
+            format!(
+                "가상 장비 private key 파일을 쓸 수 없습니다: {}",
+                private_key_pem_file.display()
+            )
+        })?;
+    tokio::fs::write(&csr_pem_file, generated.csr_pem.as_bytes())
+        .await
+        .with_context(|| {
+            format!(
+                "가상 장비 CSR 파일을 쓸 수 없습니다: {}",
+                csr_pem_file.display()
+            )
+        })?;
+    tokio::fs::write(&request_der_file, &generated.request_der)
+        .await
+        .with_context(|| {
+            format!(
+                "가상 장비 CMP 요청 DER 파일을 쓸 수 없습니다: {}",
+                request_der_file.display()
+            )
+        })?;
+
+    let server_url = if config.server_url.trim().is_empty() {
+        state.settings.public_base_url.clone()
+    } else {
+        config.server_url.clone()
+    };
+    let url = format!("{}/cmp/{}", server_url.trim_end_matches('/'), config.alias);
+    let response_bytes = post_cmp_pkixcmp(&url, generated.request_der.clone()).await?;
+    tokio::fs::write(&response_der_file, &response_bytes)
+        .await
+        .with_context(|| {
+            format!(
+                "가상 장비 CMP 응답 DER 파일을 쓸 수 없습니다: {}",
+                response_der_file.display()
+            )
+        })?;
+    let response_summary = cmp_service::summarize_pki_message_der(&response_bytes)?;
+
+    let summary = VirtualDeviceSimulationSummary {
+        device_id: config.device_id,
+        alias: config.alias,
+        subject_dn: config.subject_dn,
+        dns_names: config.dns_names,
+        url,
+        output_dir: output_dir.display().to_string(),
+        private_key_pem_file: private_key_pem_file.display().to_string(),
+        csr_pem_file: csr_pem_file.display().to_string(),
+        request_der_file: request_der_file.display().to_string(),
+        response_der_file: response_der_file.display().to_string(),
+        summary_json_file: summary_json_file.display().to_string(),
+        request_der_bytes: generated.request_der.len(),
+        request_protected: generated.request_protected,
+        response_der_bytes: response_bytes.len(),
+        response_body_type: response_summary.body_type,
+        response_body_tag: response_summary.body_tag,
+        response_protected: response_summary.protected,
+        response_extra_certs: response_summary.extra_certs,
+        issued_serial_hexes: response_summary.certificate_serial_hexes,
+    };
+    let summary_json = serde_json::to_vec_pretty(&summary)?;
+    tokio::fs::write(&summary_json_file, summary_json)
+        .await
+        .with_context(|| {
+            format!(
+                "가상 장비 시뮬레이션 요약 파일을 쓸 수 없습니다: {}",
+                summary_json_file.display()
+            )
+        })?;
+    Ok(summary)
+}
+
+fn build_cmp_p10cr_request(
+    subject_dn: &str,
+    dns_names: &[String],
+    hmac_secret: Option<&str>,
+) -> Result<GeneratedCmpP10cr> {
+    let key_pair = KeyPair::generate()?;
+    let mut params = CertificateParams::new(dns_names.to_vec())?;
+    params.distinguished_name = parse_distinguished_name(subject_dn)?;
+    let csr = params.serialize_request(&key_pair)?;
+    let csr_der = csr.der().as_ref().to_vec();
+    let csr_pem = pem::encode(&pem::Pem::new("CERTIFICATE REQUEST", csr_der.clone()));
+    let request_der =
+        cmp_service::build_p10cr_pki_message_der(&csr_der, hmac_secret.map(str::as_bytes))?;
+    let request_summary = cmp_service::summarize_pki_message_der(&request_der)?;
+    Ok(GeneratedCmpP10cr {
+        private_key_pem: key_pair.serialize_pem(),
+        csr_pem,
+        request_der,
+        request_protected: request_summary.protected,
+    })
+}
+
+async fn load_virtual_device_config(path: &str) -> Result<VirtualDeviceConfig> {
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| format!("가상 장비 설정 파일을 읽을 수 없습니다: {path}"))?;
+    if path.ends_with(".json") {
+        Ok(serde_json::from_str(&content)?)
+    } else {
+        Ok(toml::from_str(&content)?)
+    }
+}
+
+fn resolve_output_file(
+    base: &std::path::Path,
+    configured: Option<&str>,
+    default_name: &str,
+) -> PathBuf {
+    let path = PathBuf::from(configured.unwrap_or(default_name));
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
 }
 
 async fn run_cmp_issue_revoke_smoke(
@@ -1203,6 +1727,8 @@ fn issue_test_request(
         vec![format!("{device}.{dns_suffix}")]
     };
     IssueCertificateRequest {
+        end_entity_id: None,
+        approval_id: None,
         ca_id: ca_id.clone(),
         certificate_profile_id: certificate_profile_id.clone(),
         end_entity_profile_id: end_entity_profile_id.clone(),
@@ -1260,6 +1786,7 @@ mod tests {
         let data_dir = std::env::temp_dir().join(format!("ejbca-rs-cli-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&data_dir).expect("테스트 data dir 생성 실패");
         let settings = Arc::new(Settings {
+            config_file: None,
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             data_dir: data_dir.to_string_lossy().to_string(),
             database_url: None,

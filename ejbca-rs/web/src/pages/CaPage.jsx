@@ -1,5 +1,5 @@
 import React from 'react';
-import { FileKey, ShieldCheck, SlidersHorizontal } from 'lucide-react';
+import { FileKey, GitBranch, RefreshCw, ShieldCheck, SlidersHorizontal } from 'lucide-react';
 import { Panel, ProviderBadge, Table } from '../components/common';
 import { formatTs } from '../lib/format';
 
@@ -7,7 +7,7 @@ export function CaPage({ data, drafts, setters, actions }) {
   const { cas } = data;
   const { caDraft, caImportDraft } = drafts;
   const { setCaDraft, setCaImportDraft } = setters;
-  const { createCa, importCa } = actions;
+  const { createCa, importCa, renewCa, rolloverCa } = actions;
 
   return (
     <section className="grid">
@@ -87,6 +87,8 @@ export function CaPage({ data, drafts, setters, actions }) {
             <ProviderBadge value={ca.key_provider ?? 'database'} />,
             formatTs(ca.not_after),
             <div className="actionButtons">
+              <button title="CA renewal" onClick={() => renewCa(ca.id)}><RefreshCw size={16} /></button>
+              <button title="CA rollover" onClick={() => rolloverCa(ca)}><GitBranch size={16} /></button>
               <button title="수정" onClick={() => setCaDraft({
                 id: ca.id,
                 name: ca.name,

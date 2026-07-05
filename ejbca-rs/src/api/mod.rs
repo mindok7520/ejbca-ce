@@ -23,13 +23,19 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use crate::config::Settings;
 use crate::{
     AppState,
-    ca::{CreateCaRequest, ImportCaRequest, UpdateCaRequest, service as ca_service},
+    ca::{
+        CreateCaRequest, ImportCaRequest, RenewCaRequest, RolloverCaRequest, UpdateCaRequest,
+        service as ca_service,
+    },
     certs::{
         IssueCertificateRequest, IssueCsrRequest, IssuePkcs12Request, RevokeCertificateRequest,
         service as cert_service,
     },
+    cluster::{self as cluster_service, ClusterHeartbeatRequest},
     cmp::service as cmp_service,
+    compat::{self as compat_service, CreateEjbcaFeatureRequest, UpdateEjbcaFeatureRequest},
     crl::{GenerateCrlRequest, service as crl_service},
+    enrollment::issue_csr_via_alias,
     error::{AppError, AppResult},
     maintenance::{
         MaintenanceRequest, UpdateMaintenanceConfigRequest, service as maintenance_service,
@@ -40,6 +46,10 @@ use crate::{
         CreateAccessRoleRequest, CreateCertificateProfileRequest, CreateCmpAliasRequest,
         CreateEndEntityProfileRequest, UpdateAccessRoleRequest, UpdateCertificateProfileRequest,
         UpdateCmpAliasRequest, UpdateEndEntityProfileRequest, service as profile_service,
+    },
+    ra::{
+        self as ra_service, CreateApprovalRequest, CreateEndEntityRequest, DecideApprovalRequest,
+        UpdateEndEntityRequest,
     },
     storage::{AccessRoleRecord, AuditEventFilter, CertificateFilter},
     validators::{CreateValidatorRequest, UpdateValidatorRequest, service as validator_service},
@@ -83,6 +93,29 @@ struct LatestCrlQuery {
     delta: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+struct EjbcaFeatureQuery {
+    limit: Option<i64>,
+    feature_type: Option<String>,
+    status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EndEntityQuery {
+    limit: Option<i64>,
+    username: Option<String>,
+    status: Option<String>,
+    ca_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApprovalQuery {
+    limit: Option<i64>,
+    action: Option<String>,
+    target_id: Option<String>,
+    status: Option<String>,
+}
+
 pub fn router(state: AppState) -> Router {
     let body_limit = state.settings.max_request_bytes;
     let cors = cors_layer(&state.settings.cors_allowed_origins);
@@ -93,6 +126,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/summary", get(summary))
         .route("/api/v1/cas", get(list_cas).post(create_ca))
         .route("/api/v1/cas/{id}", put(update_ca))
+        .route("/api/v1/cas/{id}/renew", post(renew_ca))
+        .route("/api/v1/cas/{id}/rollover", post(rollover_ca))
         .route("/api/v1/cas/import", post(import_ca))
         .route(
             "/api/v1/certificate-profiles",
@@ -126,6 +161,34 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/access-roles/{id}",
             put(update_access_role).delete(delete_access_role),
         )
+        .route(
+            "/api/v1/ejbca/features",
+            get(list_ejbca_features).post(create_ejbca_feature),
+        )
+        .route(
+            "/api/v1/ejbca/features/{id}",
+            put(update_ejbca_feature).delete(delete_ejbca_feature),
+        )
+        .route(
+            "/api/v1/cluster/nodes",
+            get(list_cluster_nodes).post(cluster_heartbeat),
+        )
+        .route(
+            "/api/v1/end-entities",
+            get(list_end_entities).post(create_end_entity),
+        )
+        .route(
+            "/api/v1/end-entities/{id}",
+            put(update_end_entity).delete(delete_end_entity),
+        )
+        .route(
+            "/api/v1/approvals",
+            get(list_approval_requests).post(create_approval_request),
+        )
+        .route(
+            "/api/v1/approvals/{id}/decision",
+            put(decide_approval_request).post(decide_approval_request),
+        )
         .route("/api/v1/certificates", get(list_certificates))
         .route("/api/v1/certificates/issue", post(issue_generated))
         .route("/api/v1/certificates/issue-pkcs12", post(issue_pkcs12))
@@ -158,6 +221,9 @@ pub fn router(state: AppState) -> Router {
         .route("/ocsp", get(ocsp_binary_empty).post(ocsp_binary_post))
         .route("/ocsp/{encoded}", get(ocsp_binary_get))
         .route("/cmp/{alias}", post(cmp))
+        .route("/est/{alias}/simpleenroll", post(est_simpleenroll))
+        .route("/scep/{alias}/pkcsreq", post(scep_pkcsreq))
+        .route("/acme/{alias}/finalize", post(acme_finalize))
         .route("/crl/{ca_id}/latest", get(download_latest_crl))
         .fallback_service(ServeDir::new("web/dist"))
         .layer(DefaultBodyLimit::max(body_limit));
@@ -311,6 +377,30 @@ async fn import_ca(
     let actor = require_permission(&state, &headers, "ca").await?;
     Ok(Json(
         serde_json::to_value(ca_service::import_ca(&state, request, &actor).await?).unwrap(),
+    ))
+}
+
+async fn renew_ca(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<RenewCaRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let actor = require_permission(&state, &headers, "ca").await?;
+    Ok(Json(
+        serde_json::to_value(ca_service::renew_ca(&state, &id, request, &actor).await?).unwrap(),
+    ))
+}
+
+async fn rollover_ca(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<RolloverCaRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let actor = require_permission(&state, &headers, "ca").await?;
+    Ok(Json(
+        serde_json::to_value(ca_service::rollover_ca(&state, &id, request, &actor).await?).unwrap(),
     ))
 }
 
@@ -506,6 +596,194 @@ async fn delete_access_role(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_ejbca_features(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<EjbcaFeatureQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    require_permission(&state, &headers, "read").await?;
+    Ok(Json(
+        serde_json::to_value(
+            compat_service::list_features(
+                &state,
+                query.feature_type,
+                query.status,
+                bounded_list_limit(query.limit, state.settings.max_list_limit),
+            )
+            .await?,
+        )
+        .unwrap(),
+    ))
+}
+
+async fn create_ejbca_feature(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateEjbcaFeatureRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let actor = require_permission(&state, &headers, "config").await?;
+    Ok(Json(
+        serde_json::to_value(compat_service::create_feature(&state, request, &actor).await?)
+            .unwrap(),
+    ))
+}
+
+async fn update_ejbca_feature(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateEjbcaFeatureRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let actor = require_permission(&state, &headers, "config").await?;
+    Ok(Json(
+        serde_json::to_value(compat_service::update_feature(&state, &id, request, &actor).await?)
+            .unwrap(),
+    ))
+}
+
+async fn delete_ejbca_feature(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> AppResult<StatusCode> {
+    let actor = require_permission(&state, &headers, "config").await?;
+    compat_service::delete_feature(&state, &id, &actor).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_cluster_nodes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    require_permission(&state, &headers, "read").await?;
+    Ok(Json(
+        serde_json::to_value(
+            cluster_service::list_nodes(
+                &state,
+                bounded_list_limit(query.limit, state.settings.max_list_limit),
+            )
+            .await?,
+        )
+        .unwrap(),
+    ))
+}
+
+async fn cluster_heartbeat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ClusterHeartbeatRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let actor = require_permission(&state, &headers, "maintenance").await?;
+    Ok(Json(
+        serde_json::to_value(cluster_service::heartbeat(&state, request, &actor).await?).unwrap(),
+    ))
+}
+
+async fn list_end_entities(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<EndEntityQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    require_permission(&state, &headers, "read").await?;
+    Ok(Json(
+        serde_json::to_value(
+            ra_service::list_end_entities(
+                &state,
+                query.username,
+                query.status,
+                query.ca_id,
+                bounded_list_limit(query.limit, state.settings.max_list_limit),
+            )
+            .await?,
+        )
+        .unwrap(),
+    ))
+}
+
+async fn create_end_entity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateEndEntityRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let actor = require_permission(&state, &headers, "ra").await?;
+    Ok(Json(
+        serde_json::to_value(ra_service::create_end_entity(&state, request, &actor).await?)
+            .unwrap(),
+    ))
+}
+
+async fn update_end_entity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<UpdateEndEntityRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let actor = require_permission(&state, &headers, "ra").await?;
+    Ok(Json(
+        serde_json::to_value(ra_service::update_end_entity(&state, &id, request, &actor).await?)
+            .unwrap(),
+    ))
+}
+
+async fn delete_end_entity(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> AppResult<StatusCode> {
+    let actor = require_permission(&state, &headers, "ra").await?;
+    ra_service::delete_end_entity(&state, &id, &actor).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_approval_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ApprovalQuery>,
+) -> AppResult<Json<serde_json::Value>> {
+    require_permission(&state, &headers, "read").await?;
+    Ok(Json(
+        serde_json::to_value(
+            ra_service::list_approval_requests(
+                &state,
+                query.action,
+                query.target_id,
+                query.status,
+                bounded_list_limit(query.limit, state.settings.max_list_limit),
+            )
+            .await?,
+        )
+        .unwrap(),
+    ))
+}
+
+async fn create_approval_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateApprovalRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let actor = require_permission(&state, &headers, "approval").await?;
+    Ok(Json(
+        serde_json::to_value(ra_service::create_approval_request(&state, request, &actor).await?)
+            .unwrap(),
+    ))
+}
+
+async fn decide_approval_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<DecideApprovalRequest>,
+) -> AppResult<Json<serde_json::Value>> {
+    let actor = require_permission(&state, &headers, "approval").await?;
+    Ok(Json(
+        serde_json::to_value(
+            ra_service::decide_approval_request(&state, &id, request, &actor).await?,
+        )
+        .unwrap(),
+    ))
+}
+
 async fn issue_generated(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -612,7 +890,14 @@ async fn revoke_certificate(
     let actor = require_permission(&state, &headers, "revoke").await?;
     Ok(Json(
         serde_json::to_value(
-            cert_service::revoke_certificate(&state, &id, request.reason, &actor).await?,
+            cert_service::revoke_certificate(
+                &state,
+                &id,
+                request.reason,
+                request.approval_id,
+                &actor,
+            )
+            .await?,
         )
         .unwrap(),
     ))
@@ -830,7 +1115,7 @@ async fn cmp(
             "CMP 요청 content-type은 application/pkixcmp여야 합니다".to_string(),
         ));
     }
-    let status = cmp_service::accept_cmp_envelope(&state, &alias, &body).await?;
+    let status = cmp_service::accept_cmp_envelope(&state, &alias, Some(&headers), &body).await?;
     if accept_matches(&headers, "application/pkixcmp")
         && let Some(der) = status.pkixcmp_der.clone()
     {
@@ -847,6 +1132,36 @@ async fn cmp(
         Json(status),
     )
         .into_response())
+}
+
+async fn est_simpleenroll(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    body: Bytes,
+) -> AppResult<Json<serde_json::Value>> {
+    Ok(Json(
+        serde_json::to_value(issue_csr_via_alias(&state, "est", &alias, &body).await?).unwrap(),
+    ))
+}
+
+async fn scep_pkcsreq(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    body: Bytes,
+) -> AppResult<Json<serde_json::Value>> {
+    Ok(Json(
+        serde_json::to_value(issue_csr_via_alias(&state, "scep", &alias, &body).await?).unwrap(),
+    ))
+}
+
+async fn acme_finalize(
+    State(state): State<AppState>,
+    Path(alias): Path<String>,
+    body: Bytes,
+) -> AppResult<Json<serde_json::Value>> {
+    Ok(Json(
+        serde_json::to_value(issue_csr_via_alias(&state, "acme", &alias, &body).await?).unwrap(),
+    ))
 }
 
 fn crl_response(der: Vec<u8>, filename: String) -> Response {
@@ -1476,10 +1791,20 @@ mod tests {
     use tower::{ServiceBuilder, ServiceExt, service_fn};
     use uuid::Uuid;
 
+    fn test_settings_from_cli_defaults() -> Settings {
+        std::thread::Builder::new()
+            .name("settings-parse-test".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| Settings::parse_from(["ejbca-rs"]))
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
     async fn test_state() -> (AppState, PathBuf) {
         let data_dir = std::env::temp_dir().join(format!("ejbca-rs-api-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&data_dir).unwrap();
-        let mut settings = Settings::parse_from(["ejbca-rs"]);
+        let mut settings = test_settings_from_cli_defaults();
         settings.data_dir = data_dir.to_string_lossy().to_string();
         settings.database_url = None;
         settings.admin_token = Some("test-admin-token".to_string());
@@ -1581,7 +1906,7 @@ mod tests {
             .unwrap();
         let cert_pem = cert.pem();
         let parsed = parse_adminweb_client_certificate(&cert_pem).unwrap();
-        let mut settings = Settings::parse_from(["ejbca-rs"]);
+        let mut settings = test_settings_from_cli_defaults();
         settings.adminweb_client_cert_required = true;
         settings.adminweb_client_cert_proxy_secret = Some("proxy-secret".to_string());
         settings.adminweb_client_cert_allowed_fingerprints =
@@ -1606,7 +1931,7 @@ mod tests {
 
     #[test]
     fn adminweb_session_rejects_missing_certificate_when_required() {
-        let mut settings = Settings::parse_from(["ejbca-rs"]);
+        let mut settings = test_settings_from_cli_defaults();
         settings.adminweb_client_cert_required = true;
 
         let session = evaluate_adminweb_certificate_for_settings(&settings, &HeaderMap::new());

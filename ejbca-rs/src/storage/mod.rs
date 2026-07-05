@@ -36,6 +36,8 @@ pub struct CaRecord {
 pub struct CertificateRecord {
     pub id: String,
     pub ca_id: String,
+    pub certificate_profile_id: Option<String>,
+    pub end_entity_profile_id: Option<String>,
     pub serial_hex: String,
     pub subject_dn: String,
     pub san_json: String,
@@ -112,6 +114,30 @@ pub struct EndEntityProfileRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct EndEntityRecord {
+    pub id: String,
+    pub username: String,
+    pub subject_dn: String,
+    pub san_json: String,
+    pub email: Option<String>,
+    pub ca_id: Option<String>,
+    pub certificate_profile_id: Option<String>,
+    pub end_entity_profile_id: Option<String>,
+    pub status: String,
+    pub password_hash: Option<String>,
+    pub token_type: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EndEntityFilter {
+    pub username_contains: Option<String>,
+    pub status: Option<String>,
+    pub ca_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct CmpAliasRecord {
     pub id: String,
     pub alias: String,
@@ -135,6 +161,57 @@ pub struct AccessRoleRecord {
     pub certificate_match_value: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct EjbcaFeatureRecord {
+    pub id: String,
+    pub feature_type: String,
+    pub name: String,
+    pub status: String,
+    pub config_json: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ClusterNodeRecord {
+    pub id: String,
+    pub node_id: String,
+    pub role: String,
+    pub status: String,
+    pub heartbeat_at: i64,
+    pub metadata_json: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EjbcaFeatureFilter {
+    pub feature_type: Option<String>,
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct ApprovalRequestRecord {
+    pub id: String,
+    pub action: String,
+    pub target_id: String,
+    pub status: String,
+    pub requester: String,
+    pub approver: Option<String>,
+    pub request_json: String,
+    pub decision_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ApprovalRequestFilter {
+    pub action: Option<String>,
+    pub target_id: Option<String>,
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -249,6 +326,7 @@ pub struct DashboardSummary {
     pub end_entity_profile_count: i64,
     pub cmp_alias_count: i64,
     pub access_role_count: i64,
+    pub ejbca_feature_count: i64,
     pub issue_success_count: i64,
     pub issue_failure_count: i64,
 }
@@ -297,6 +375,18 @@ impl Db {
             .await?;
         self.ensure_column("cas", "is_default", "INTEGER NOT NULL DEFAULT 0")
             .await?;
+        self.ensure_column(
+            "certificates",
+            "certificate_profile_id",
+            "TEXT REFERENCES certificate_profiles(id) ON DELETE SET NULL",
+        )
+        .await?;
+        self.ensure_column(
+            "certificates",
+            "end_entity_profile_id",
+            "TEXT REFERENCES end_entity_profiles(id) ON DELETE SET NULL",
+        )
+        .await?;
         self.ensure_column("access_roles", "certificate_issuer_dn", "TEXT")
             .await?;
         self.ensure_column("access_roles", "certificate_match_key", "TEXT")
@@ -328,6 +418,11 @@ impl Db {
         .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS access_roles_cert_member_idx ON access_roles(certificate_issuer_dn, certificate_match_key, certificate_match_value) WHERE certificate_match_key IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS certs_profiles_idx ON certificates(certificate_profile_id, end_entity_profile_id)",
         )
         .execute(&self.pool)
         .await?;
@@ -431,13 +526,19 @@ impl Db {
         let result = sqlx::query(
             r#"
             UPDATE cas
-            SET name = ?, status = ?, is_default = ?
+            SET name = ?, subject_dn = ?, cert_pem = ?, key_pem = ?, cert_der = ?,
+                status = ?, is_default = ?, not_after = ?
             WHERE id = ?
             "#,
         )
         .bind(&ca.name)
+        .bind(&ca.subject_dn)
+        .bind(&ca.cert_pem)
+        .bind(&ca.key_pem)
+        .bind(&ca.cert_der)
         .bind(&ca.status)
         .bind(ca.is_default)
+        .bind(ca.not_after)
         .bind(&ca.id)
         .execute(&mut *tx)
         .await?;
@@ -449,13 +550,15 @@ impl Db {
         sqlx::query(
             r#"
             INSERT INTO certificates
-                (id, ca_id, serial_hex, subject_dn, san_json, cert_pem, cert_der, csr_pem,
+                (id, ca_id, certificate_profile_id, end_entity_profile_id, serial_hex, subject_dn, san_json, cert_pem, cert_der, csr_pem,
                  status, revocation_reason, revoked_at, not_before, not_after, fingerprint_sha256, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&cert.id)
         .bind(&cert.ca_id)
+        .bind(&cert.certificate_profile_id)
+        .bind(&cert.end_entity_profile_id)
         .bind(&cert.serial_hex)
         .bind(&cert.subject_dn)
         .bind(&cert.san_json)
@@ -488,13 +591,15 @@ impl Db {
         sqlx::query(
             r#"
             INSERT INTO certificates
-                (id, ca_id, serial_hex, subject_dn, san_json, cert_pem, cert_der, csr_pem,
+                (id, ca_id, certificate_profile_id, end_entity_profile_id, serial_hex, subject_dn, san_json, cert_pem, cert_der, csr_pem,
                  status, revocation_reason, revoked_at, not_before, not_after, fingerprint_sha256, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&cert.id)
         .bind(&cert.ca_id)
+        .bind(&cert.certificate_profile_id)
+        .bind(&cert.end_entity_profile_id)
         .bind(&cert.serial_hex)
         .bind(&cert.subject_dn)
         .bind(&cert.san_json)
@@ -1058,6 +1163,8 @@ impl Db {
             .await?,
             cmp_alias_count: scalar_i64(&self.pool, "SELECT COUNT(*) FROM cmp_aliases").await?,
             access_role_count: scalar_i64(&self.pool, "SELECT COUNT(*) FROM access_roles").await?,
+            ejbca_feature_count: scalar_i64(&self.pool, "SELECT COUNT(*) FROM ejbca_features")
+                .await?,
             issue_success_count: scalar_i64(
                 &self.pool,
                 "SELECT COUNT(*) FROM certificate_events WHERE event_type = 'issue' AND status = 'success'",
@@ -1397,6 +1504,141 @@ impl Db {
             .rows_affected())
     }
 
+    pub async fn insert_end_entity(&self, entity: &EndEntityRecord) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO end_entities
+                (id, username, subject_dn, san_json, email, ca_id, certificate_profile_id,
+                 end_entity_profile_id, status, password_hash, token_type, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&entity.id)
+        .bind(&entity.username)
+        .bind(&entity.subject_dn)
+        .bind(&entity.san_json)
+        .bind(&entity.email)
+        .bind(&entity.ca_id)
+        .bind(&entity.certificate_profile_id)
+        .bind(&entity.end_entity_profile_id)
+        .bind(&entity.status)
+        .bind(&entity.password_hash)
+        .bind(&entity.token_type)
+        .bind(entity.created_at)
+        .bind(entity.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_end_entities(
+        &self,
+        filter: &EndEntityFilter,
+        limit: i64,
+    ) -> AppResult<Vec<EndEntityRecord>> {
+        Ok(sqlx::query_as::<_, EndEntityRecord>(
+            r#"
+            SELECT *
+            FROM end_entities
+            WHERE (? IS NULL OR instr(lower(username), lower(?)) > 0)
+              AND (? IS NULL OR status = ?)
+              AND (? IS NULL OR ca_id = ?)
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(filter.username_contains.as_deref())
+        .bind(filter.username_contains.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(filter.ca_id.as_deref())
+        .bind(filter.ca_id.as_deref())
+        .bind(limit.clamp(1, 10_000))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn get_end_entity(&self, id: &str) -> AppResult<Option<EndEntityRecord>> {
+        Ok(
+            sqlx::query_as::<_, EndEntityRecord>("SELECT * FROM end_entities WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn get_end_entity_by_username(
+        &self,
+        username: &str,
+    ) -> AppResult<Option<EndEntityRecord>> {
+        Ok(
+            sqlx::query_as::<_, EndEntityRecord>("SELECT * FROM end_entities WHERE username = ?")
+                .bind(username)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn update_end_entity(&self, entity: &EndEntityRecord) -> AppResult<u64> {
+        Ok(sqlx::query(
+            r#"
+            UPDATE end_entities
+            SET username = ?,
+                subject_dn = ?,
+                san_json = ?,
+                email = ?,
+                ca_id = ?,
+                certificate_profile_id = ?,
+                end_entity_profile_id = ?,
+                status = ?,
+                password_hash = ?,
+                token_type = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&entity.username)
+        .bind(&entity.subject_dn)
+        .bind(&entity.san_json)
+        .bind(&entity.email)
+        .bind(&entity.ca_id)
+        .bind(&entity.certificate_profile_id)
+        .bind(&entity.end_entity_profile_id)
+        .bind(&entity.status)
+        .bind(&entity.password_hash)
+        .bind(&entity.token_type)
+        .bind(entity.updated_at)
+        .bind(&entity.id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    pub async fn update_end_entity_status(
+        &self,
+        id: &str,
+        status: &str,
+        updated_at: i64,
+    ) -> AppResult<u64> {
+        Ok(
+            sqlx::query("UPDATE end_entities SET status = ?, updated_at = ? WHERE id = ?")
+                .bind(status)
+                .bind(updated_at)
+                .bind(id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
+    pub async fn delete_end_entity(&self, id: &str) -> AppResult<u64> {
+        Ok(sqlx::query("DELETE FROM end_entities WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
+    }
+
     pub async fn cmp_alias_count(&self) -> AppResult<i64> {
         scalar_i64(&self.pool, "SELECT COUNT(*) FROM cmp_aliases").await
     }
@@ -1591,6 +1833,242 @@ impl Db {
             .execute(&self.pool)
             .await?
             .rows_affected())
+    }
+
+    pub async fn ejbca_feature_count(&self) -> AppResult<i64> {
+        scalar_i64(&self.pool, "SELECT COUNT(*) FROM ejbca_features").await
+    }
+
+    pub async fn insert_ejbca_feature(&self, feature: &EjbcaFeatureRecord) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO ejbca_features
+                (id, feature_type, name, status, config_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&feature.id)
+        .bind(&feature.feature_type)
+        .bind(&feature.name)
+        .bind(&feature.status)
+        .bind(&feature.config_json)
+        .bind(feature.created_at)
+        .bind(feature.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_ejbca_features(
+        &self,
+        filter: &EjbcaFeatureFilter,
+        limit: i64,
+    ) -> AppResult<Vec<EjbcaFeatureRecord>> {
+        Ok(sqlx::query_as::<_, EjbcaFeatureRecord>(
+            r#"
+            SELECT *
+            FROM ejbca_features
+            WHERE (? IS NULL OR feature_type = ?)
+              AND (? IS NULL OR status = ?)
+            ORDER BY feature_type ASC, created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(filter.feature_type.as_deref())
+        .bind(filter.feature_type.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(limit.clamp(1, 10_000))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn get_ejbca_feature(&self, id: &str) -> AppResult<Option<EjbcaFeatureRecord>> {
+        Ok(
+            sqlx::query_as::<_, EjbcaFeatureRecord>("SELECT * FROM ejbca_features WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn update_ejbca_feature(&self, feature: &EjbcaFeatureRecord) -> AppResult<u64> {
+        Ok(sqlx::query(
+            r#"
+            UPDATE ejbca_features
+            SET feature_type = ?,
+                name = ?,
+                status = ?,
+                config_json = ?,
+                updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&feature.feature_type)
+        .bind(&feature.name)
+        .bind(&feature.status)
+        .bind(&feature.config_json)
+        .bind(feature.updated_at)
+        .bind(&feature.id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
+    }
+
+    pub async fn delete_ejbca_feature(&self, id: &str) -> AppResult<u64> {
+        Ok(sqlx::query("DELETE FROM ejbca_features WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected())
+    }
+
+    pub async fn upsert_cluster_node(&self, node: &ClusterNodeRecord) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO cluster_nodes
+                (id, node_id, role, status, heartbeat_at, metadata_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(node_id) DO UPDATE SET
+                role = excluded.role,
+                status = excluded.status,
+                heartbeat_at = excluded.heartbeat_at,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at
+            "#,
+        )
+        .bind(&node.id)
+        .bind(&node.node_id)
+        .bind(&node.role)
+        .bind(&node.status)
+        .bind(node.heartbeat_at)
+        .bind(&node.metadata_json)
+        .bind(node.created_at)
+        .bind(node.updated_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_cluster_nodes(&self, limit: i64) -> AppResult<Vec<ClusterNodeRecord>> {
+        Ok(sqlx::query_as::<_, ClusterNodeRecord>(
+            r#"
+            SELECT *
+            FROM cluster_nodes
+            ORDER BY heartbeat_at DESC, node_id ASC
+            LIMIT ?
+            "#,
+        )
+        .bind(limit.clamp(1, 10_000))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn get_cluster_node_by_node_id(
+        &self,
+        node_id: &str,
+    ) -> AppResult<Option<ClusterNodeRecord>> {
+        Ok(
+            sqlx::query_as::<_, ClusterNodeRecord>("SELECT * FROM cluster_nodes WHERE node_id = ?")
+                .bind(node_id)
+                .fetch_optional(&self.pool)
+                .await?,
+        )
+    }
+
+    pub async fn insert_approval_request(&self, approval: &ApprovalRequestRecord) -> AppResult<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO approval_requests
+                (id, action, target_id, status, requester, approver, request_json,
+                 decision_json, created_at, updated_at, expires_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&approval.id)
+        .bind(&approval.action)
+        .bind(&approval.target_id)
+        .bind(&approval.status)
+        .bind(&approval.requester)
+        .bind(&approval.approver)
+        .bind(&approval.request_json)
+        .bind(&approval.decision_json)
+        .bind(approval.created_at)
+        .bind(approval.updated_at)
+        .bind(approval.expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_approval_requests(
+        &self,
+        filter: &ApprovalRequestFilter,
+        limit: i64,
+    ) -> AppResult<Vec<ApprovalRequestRecord>> {
+        Ok(sqlx::query_as::<_, ApprovalRequestRecord>(
+            r#"
+            SELECT *
+            FROM approval_requests
+            WHERE (? IS NULL OR action = ?)
+              AND (? IS NULL OR target_id = ?)
+              AND (? IS NULL OR status = ?)
+            ORDER BY created_at DESC
+            LIMIT ?
+            "#,
+        )
+        .bind(filter.action.as_deref())
+        .bind(filter.action.as_deref())
+        .bind(filter.target_id.as_deref())
+        .bind(filter.target_id.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(limit.clamp(1, 10_000))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn get_approval_request(&self, id: &str) -> AppResult<Option<ApprovalRequestRecord>> {
+        Ok(sqlx::query_as::<_, ApprovalRequestRecord>(
+            "SELECT * FROM approval_requests WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    pub async fn update_approval_request(
+        &self,
+        approval: &ApprovalRequestRecord,
+    ) -> AppResult<u64> {
+        Ok(sqlx::query(
+            r#"
+            UPDATE approval_requests
+            SET action = ?,
+                target_id = ?,
+                status = ?,
+                requester = ?,
+                approver = ?,
+                request_json = ?,
+                decision_json = ?,
+                updated_at = ?,
+                expires_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&approval.action)
+        .bind(&approval.target_id)
+        .bind(&approval.status)
+        .bind(&approval.requester)
+        .bind(&approval.approver)
+        .bind(&approval.request_json)
+        .bind(&approval.decision_json)
+        .bind(approval.updated_at)
+        .bind(approval.expires_at)
+        .bind(&approval.id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected())
     }
 
     pub async fn purge_expired_certificates(
@@ -1819,6 +2297,8 @@ CREATE TABLE IF NOT EXISTS cas (
 CREATE TABLE IF NOT EXISTS certificates (
     id TEXT PRIMARY KEY,
     ca_id TEXT NOT NULL REFERENCES cas(id) ON DELETE CASCADE,
+    certificate_profile_id TEXT REFERENCES certificate_profiles(id) ON DELETE SET NULL,
+    end_entity_profile_id TEXT REFERENCES end_entity_profiles(id) ON DELETE SET NULL,
     serial_hex TEXT NOT NULL,
     subject_dn TEXT NOT NULL,
     san_json TEXT NOT NULL,
@@ -1844,6 +2324,7 @@ CREATE INDEX IF NOT EXISTS certs_status_created_idx ON certificates(status, crea
 CREATE INDEX IF NOT EXISTS certs_ca_status_created_idx ON certificates(ca_id, status, created_at DESC);
 CREATE INDEX IF NOT EXISTS certs_status_not_after_idx ON certificates(status, not_after);
 CREATE INDEX IF NOT EXISTS certs_ca_status_not_after_idx ON certificates(ca_id, status, not_after);
+CREATE INDEX IF NOT EXISTS certs_profiles_idx ON certificates(certificate_profile_id, end_entity_profile_id);
 
 CREATE TABLE IF NOT EXISTS crls (
     id TEXT PRIMARY KEY,
@@ -1895,6 +2376,26 @@ CREATE TABLE IF NOT EXISTS end_entity_profiles (
     updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS end_entities (
+    id TEXT PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    subject_dn TEXT NOT NULL,
+    san_json TEXT NOT NULL,
+    email TEXT,
+    ca_id TEXT REFERENCES cas(id) ON DELETE SET NULL,
+    certificate_profile_id TEXT REFERENCES certificate_profiles(id) ON DELETE SET NULL,
+    end_entity_profile_id TEXT REFERENCES end_entity_profiles(id) ON DELETE SET NULL,
+    status TEXT NOT NULL,
+    password_hash TEXT,
+    token_type TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS end_entities_status_idx ON end_entities(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS end_entities_ca_status_idx ON end_entities(ca_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS end_entities_profiles_idx ON end_entities(certificate_profile_id, end_entity_profile_id);
+
 CREATE TABLE IF NOT EXISTS cmp_aliases (
     id TEXT PRIMARY KEY,
     alias TEXT NOT NULL UNIQUE,
@@ -1918,6 +2419,51 @@ CREATE TABLE IF NOT EXISTS access_roles (
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ejbca_features (
+    id TEXT PRIMARY KEY,
+    feature_type TEXT NOT NULL,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(feature_type, name)
+);
+
+CREATE INDEX IF NOT EXISTS ejbca_features_type_status_idx ON ejbca_features(feature_type, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS ejbca_features_status_idx ON ejbca_features(status, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS cluster_nodes (
+    id TEXT PRIMARY KEY,
+    node_id TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL,
+    status TEXT NOT NULL,
+    heartbeat_at INTEGER NOT NULL,
+    metadata_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS cluster_nodes_status_heartbeat_idx ON cluster_nodes(status, heartbeat_at DESC);
+CREATE INDEX IF NOT EXISTS cluster_nodes_role_heartbeat_idx ON cluster_nodes(role, heartbeat_at DESC);
+
+CREATE TABLE IF NOT EXISTS approval_requests (
+    id TEXT PRIMARY KEY,
+    action TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    requester TEXT NOT NULL,
+    approver TEXT,
+    request_json TEXT NOT NULL,
+    decision_json TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    expires_at INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS approval_action_target_status_idx ON approval_requests(action, target_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS approval_status_expires_idx ON approval_requests(status, expires_at);
 
 CREATE TABLE IF NOT EXISTS audit_events (
     id TEXT PRIMARY KEY,
@@ -2016,6 +2562,13 @@ mod tests {
             "audit_chain_index_uidx",
             "audit_chain_scan_idx",
             "audit_legacy_ts_idx",
+            "ejbca_features_type_status_idx",
+            "ejbca_features_status_idx",
+            "end_entities_status_idx",
+            "end_entities_ca_status_idx",
+            "end_entities_profiles_idx",
+            "approval_action_target_status_idx",
+            "approval_status_expires_idx",
         ] {
             assert!(
                 sqlite_index_exists(&db, index).await,
@@ -2023,6 +2576,155 @@ mod tests {
             );
         }
 
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn manages_ejbca_feature_records() {
+        let (db, dir) = temp_db().await;
+        db.migrate().await.unwrap();
+        let now = crate::util::now_unix();
+        let mut feature = EjbcaFeatureRecord {
+            id: "feature-1".to_string(),
+            feature_type: "enrollment_protocol".to_string(),
+            name: "est".to_string(),
+            status: "configured".to_string(),
+            config_json: r#"{"endpoint":"/.well-known/est"}"#.to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        db.insert_ejbca_feature(&feature).await.unwrap();
+        assert_eq!(db.ejbca_feature_count().await.unwrap(), 1);
+
+        let rows = db
+            .list_ejbca_features(
+                &EjbcaFeatureFilter {
+                    feature_type: Some("enrollment_protocol".to_string()),
+                    status: Some("configured".to_string()),
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "est");
+
+        feature.status = "active".to_string();
+        feature.config_json = r#"{"endpoint":"/est"}"#.to_string();
+        assert_eq!(db.update_ejbca_feature(&feature).await.unwrap(), 1);
+        assert_eq!(
+            db.get_ejbca_feature("feature-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
+
+        assert_eq!(db.delete_ejbca_feature("feature-1").await.unwrap(), 1);
+        assert_eq!(db.ejbca_feature_count().await.unwrap(), 0);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn manages_end_entities_and_approval_requests() {
+        let (db, dir) = temp_db().await;
+        db.migrate().await.unwrap();
+        let now = crate::util::now_unix();
+        let mut entity = EndEntityRecord {
+            id: "entity-1".to_string(),
+            username: "device-001".to_string(),
+            subject_dn: "CN=device-001,O=Example,C=KR".to_string(),
+            san_json: r#"["device-001.example.com"]"#.to_string(),
+            email: Some("device-001@example.com".to_string()),
+            ca_id: None,
+            certificate_profile_id: None,
+            end_entity_profile_id: None,
+            status: "NEW".to_string(),
+            password_hash: Some("hash".to_string()),
+            token_type: "USERGENERATED".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        db.insert_end_entity(&entity).await.unwrap();
+        let entities = db
+            .list_end_entities(
+                &EndEntityFilter {
+                    username_contains: Some("device".to_string()),
+                    status: Some("NEW".to_string()),
+                    ca_id: None,
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].username, "device-001");
+        assert!(
+            db.get_end_entity_by_username("device-001")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        entity.status = "GENERATED".to_string();
+        entity.updated_at = now + 1;
+        assert_eq!(db.update_end_entity(&entity).await.unwrap(), 1);
+        assert_eq!(
+            db.get_end_entity("entity-1").await.unwrap().unwrap().status,
+            "GENERATED"
+        );
+        assert_eq!(
+            db.update_end_entity_status("entity-1", "REVOKED", now + 2)
+                .await
+                .unwrap(),
+            1
+        );
+
+        let mut approval = ApprovalRequestRecord {
+            id: "approval-1".to_string(),
+            action: "issue".to_string(),
+            target_id: "entity-1".to_string(),
+            status: "pending".to_string(),
+            requester: "operator".to_string(),
+            approver: None,
+            request_json: r#"{"reason":"initial"}"#.to_string(),
+            decision_json: None,
+            created_at: now,
+            updated_at: now,
+            expires_at: Some(now + 3600),
+        };
+        db.insert_approval_request(&approval).await.unwrap();
+        let approvals = db
+            .list_approval_requests(
+                &ApprovalRequestFilter {
+                    action: Some("issue".to_string()),
+                    target_id: Some("entity-1".to_string()),
+                    status: Some("pending".to_string()),
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(approvals.len(), 1);
+
+        approval.status = "approved".to_string();
+        approval.approver = Some("approver".to_string());
+        approval.decision_json = Some(r#"{"ok":true}"#.to_string());
+        approval.updated_at = now + 3;
+        assert_eq!(db.update_approval_request(&approval).await.unwrap(), 1);
+        assert_eq!(
+            db.get_approval_request("approval-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "approved"
+        );
+
+        assert_eq!(db.delete_end_entity("entity-1").await.unwrap(), 1);
         std::fs::remove_dir_all(dir).ok();
     }
 

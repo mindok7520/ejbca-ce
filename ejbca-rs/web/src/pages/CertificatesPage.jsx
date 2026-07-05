@@ -3,7 +3,7 @@ import { Download, FileKey, KeyRound, RefreshCw, ShieldCheck, Trash2 } from 'luc
 import { Panel } from '../components/common';
 
 export function CertificatesPage({ data, drafts, setters, actions }) {
-  const { cas, certs } = data;
+  const { cas, certs, endEntities, approvals } = data;
   const { issue, csr, certFilter } = drafts;
   const { setIssue, setCsr, setCertFilter } = setters;
   const { issueGenerated, issueBrowserCertificate, issueCsr, refreshAll, downloadCertificate, revoke } = actions;
@@ -11,6 +11,27 @@ export function CertificatesPage({ data, drafts, setters, actions }) {
   return (
     <section className="grid">
       <Panel title="인증서 발급" icon={FileKey}>
+        <label>RA end entity / approval</label>
+        <div className="inlineControls">
+          <select
+            value={issue.end_entity_id}
+            onChange={(e) => setIssue({ ...issue, end_entity_id: e.target.value })}
+          >
+            <option value="">End entity 직접 입력</option>
+            {endEntities.map((entity) => (
+              <option key={entity.id} value={entity.id}>{entity.username}</option>
+            ))}
+          </select>
+          <select
+            value={issue.approval_id}
+            onChange={(e) => setIssue({ ...issue, approval_id: e.target.value })}
+          >
+            <option value="">Approval 없음</option>
+            {approvals.filter((approval) => approval.status === 'approved').map((approval) => (
+              <option key={approval.id} value={approval.id}>{approval.action}:{approval.target_id}</option>
+            ))}
+          </select>
+        </div>
         <label>Subject DN</label>
         <input value={issue.subject_dn} onChange={(e) => setIssue({ ...issue, subject_dn: e.target.value })} />
         <label>DNS SAN</label>
